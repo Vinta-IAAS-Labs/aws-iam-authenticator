@@ -1,9 +1,13 @@
+// Package crd implements IAM identity mapping using Kubernetes Custom Resource Definitions.
 package crd
 
 import (
 	"fmt"
 	"strings"
 	"time"
+
+	"sigs.k8s.io/aws-iam-authenticator/pkg/errutil"
+	"sigs.k8s.io/aws-iam-authenticator/pkg/token"
 
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -17,7 +21,8 @@ import (
 	informers "sigs.k8s.io/aws-iam-authenticator/pkg/mapper/crd/generated/informers/externalversions"
 )
 
-type CRDMapper struct {
+// CRDMapper implements the Mapper interface using Kubernetes CRDs.
+type CRDMapper struct { //nolint:revive // exported: stutter preserved for backwards compatibility
 	*controller.Controller
 	// iamInformerFactory is an informer factory that must be Started
 	iamInformerFactory informers.SharedInformerFactory
@@ -25,10 +30,13 @@ type CRDMapper struct {
 	iamMappingsSynced cache.InformerSynced
 	// iamMappingsIndex is a custom indexer which allows for indexing on canonical arns
 	iamMappingsIndex cache.Indexer
+	// usernamePrefixReserveList holds reserved username prefixes from cfg.ReservedPrefixConfig that mapped usernames must not begin with.
+	usernamePrefixReserveList []string
 }
 
 var _ mapper.Mapper = &CRDMapper{}
 
+// NewCRDMapper creates a new CRDMapper connected to the Kubernetes API.
 func NewCRDMapper(cfg config.Config) (*CRDMapper, error) {
 	var err error
 	var k8sconfig *rest.Config
@@ -63,22 +71,35 @@ func NewCRDMapper(cfg config.Config) (*CRDMapper, error) {
 
 	ctrl := controller.New(kubeClient, iamClient, iamMappingInformer)
 
-	return &CRDMapper{ctrl, iamInformerFactory, iamMappingsSynced, iamMappingsIndex}, nil
+	cm := &CRDMapper{
+		Controller:         ctrl,
+		iamInformerFactory: iamInformerFactory,
+		iamMappingsSynced:  iamMappingsSynced,
+		iamMappingsIndex:   iamMappingsIndex,
+	}
+	if value, exists := cfg.ReservedPrefixConfig[mapper.ModeCRD]; exists {
+		cm.usernamePrefixReserveList = value.UsernamePrefixReserveList
+	}
+
+	return cm, nil
 }
 
+// NewCRDMapperWithIndexer creates a CRDMapper using the provided cache indexer, for testing.
 func NewCRDMapperWithIndexer(iamMappingsIndex cache.Indexer) *CRDMapper {
 	return &CRDMapper{iamMappingsIndex: iamMappingsIndex}
 }
 
+// Name returns the name of this mapper backend.
 func (m *CRDMapper) Name() string {
 	return mapper.ModeCRD
 }
 
+// Start launches the CRD informer and controller goroutines.
 func (m *CRDMapper) Start(stopCh <-chan struct{}) error {
 	m.iamInformerFactory.Start(stopCh)
 	go func() {
 		// Run starts worker goroutines and blocks
-		if err := m.Controller.Run(2, stopCh); err != nil {
+		if err := m.Run(2, stopCh); err != nil {
 			panic(err)
 		}
 	}()
@@ -86,8 +107,9 @@ func (m *CRDMapper) Start(stopCh <-chan struct{}) error {
 	return nil
 }
 
-func (m *CRDMapper) Map(canonicalARN string) (*config.IdentityMapping, error) {
-	canonicalARN = strings.ToLower(canonicalARN)
+// Map resolves an IAM identity to a Kubernetes identity mapping.
+func (m *CRDMapper) Map(identity *token.Identity) (*config.IdentityMapping, error) {
+	canonicalARN := strings.ToLower(identity.CanonicalARN)
 
 	var iamidentity *iamauthenticatorv1alpha1.IAMIdentityMapping
 	var ok bool
@@ -113,9 +135,15 @@ func (m *CRDMapper) Map(canonicalARN string) (*config.IdentityMapping, error) {
 		}
 	}
 
-	return nil, mapper.ErrNotMapped
+	return nil, errutil.ErrNotMapped
 }
 
-func (m *CRDMapper) IsAccountAllowed(accountID string) bool {
+// IsAccountAllowed returns false; CRD mapper does not support account-based allow-listing.
+func (m *CRDMapper) IsAccountAllowed(_ string) bool {
 	return false
+}
+
+// UsernamePrefixReserveList returns username prefixes reserved by this mapper.
+func (m *CRDMapper) UsernamePrefixReserveList() []string {
+	return m.usernamePrefixReserveList
 }

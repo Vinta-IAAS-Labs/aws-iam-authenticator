@@ -19,17 +19,22 @@ set -o nounset
 set -o pipefail
 
 SCRIPT_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
-CODEGEN_PKG=${CODEGEN_PKG:-$(cd "${SCRIPT_ROOT}"; ls -d -1 ./vendor/k8s.io/code-generator 2>/dev/null || echo ../code-generator)}
-chmod +x ${CODEGEN_PKG}/generate-groups.sh
-# generate the code with:
-# --output-base    because this script should also be able to run inside the vendor dir of
-#                  k8s.io/kubernetes. The output-base is needed for the generators to output into the vendor dir
-#                  instead of the $GOPATH directly. For normal projects this can be dropped.
-"${CODEGEN_PKG}"/generate-groups.sh "deepcopy,client,informer,lister" \
-  sigs.k8s.io/aws-iam-authenticator/pkg/mapper/crd/generated sigs.k8s.io/aws-iam-authenticator/pkg/mapper/crd/apis \
-  iamauthenticator:v1alpha1 \
-  --output-base "$(dirname "${BASH_SOURCE[0]}")/../../.." \
-  --go-header-file "${SCRIPT_ROOT}"/hack/boilerplate.go.txt
+CODE_GEN_VERSION=$(go mod edit -print |grep 'k8s.io/code-generator' | cut -f2 -d' ')
+CODE_GEN_PKG=${CODE_GEN_PKG:-$GOPATH/pkg/mod/k8s.io/code-generator\@${CODE_GEN_VERSION}}
+chmod +x ${CODE_GEN_PKG}/kube_codegen.sh
 
-# To use your own boilerplate text append:
-#   --go-header-file "${SCRIPT_ROOT}"/hack/custom-boilerplate.go.txt
+AUTHENTICATOR_ROOT="${SCRIPT_ROOT}/pkg/mapper/crd"
+AUTHENTICATOR_PKG="sigs.k8s.io/aws-iam-authenticator"
+
+source "${CODE_GEN_PKG}/kube_codegen.sh"
+
+kube::codegen::gen_helpers \
+	--boilerplate "${SCRIPT_ROOT}/hack/boilerplate.go.txt" \
+  "${AUTHENTICATOR_ROOT}/apis" \
+
+kube::codegen::gen_client \
+  --boilerplate "${SCRIPT_ROOT}/hack/boilerplate.go.txt" \
+  --output-dir "${AUTHENTICATOR_ROOT}/generated" \
+  --output-pkg "${AUTHENTICATOR_PKG}/pkg/mapper/crd/generated" \
+  --with-watch \
+  "${AUTHENTICATOR_ROOT}/apis" \

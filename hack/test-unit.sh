@@ -1,4 +1,6 @@
-# Copyright 2022 The Kubernetes Authors.
+#!/usr/bin/env bash
+
+# Copyright 2016 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,11 +13,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-ARG image=public.ecr.aws/eks-distro-build-tooling/eks-distro-minimal-base-nonroot:2021-12-01-1638322424
 
-FROM public.ecr.aws/eks-distro/kubernetes/go-runner:v0.9.0-eks-1-21-4 as go-runner
+set -o errexit
+set -o pipefail
+set -o nounset
 
-FROM $image
-COPY --from=go-runner /usr/local/bin/go-runner /usr/local/bin/go-runner
-COPY aws-iam-authenticator /aws-iam-authenticator
-ENTRYPOINT ["/aws-iam-authenticator"]
+# cd to the repo root and setup go
+REPO_ROOT="$(cd "$( dirname "${BASH_SOURCE[0]}" )"/.. &> /dev/null && pwd)"
+
+source hack/setup-go.sh
+
+pushd ${REPO_ROOT}
+
+go version
+go test -v -coverprofile=coverage.out -race sigs.k8s.io/aws-iam-authenticator/pkg/...
+go tool cover -html=coverage.out -o coverage.html
+popd

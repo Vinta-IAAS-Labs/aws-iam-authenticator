@@ -21,12 +21,30 @@ import (
 	"net/http"
 
 	"sigs.k8s.io/aws-iam-authenticator/pkg/config"
+	"sigs.k8s.io/aws-iam-authenticator/pkg/mapper"
 )
 
 // Server for the authentication webhook.
 type Server struct {
 	// Config is the whole configuration of aws-iam-authenticator used for valid keys and certs, kubeconfig, and so on
 	config.Config
-	httpServer http.Server
-	listener   net.Listener
+	httpServer      http.Server
+	listener        net.Listener
+	internalHandler *handler
+}
+
+// BackendMapper is the interface implemented by all IAM identity mapping backends.
+type BackendMapper struct {
+	mappers      []mapper.Mapper
+	mapperStopCh chan struct{}
+	currentModes string
+}
+
+// BackendModeConfig represents the configuration format for cluster access config via backend mode.
+type BackendModeConfig struct {
+	// Time that the object takes from update time to load time
+	LastUpdatedDateTime string `json:"LastUpdatedDateTime"`
+	// Version is the version number of the update
+	Version     string `json:"Version"`
+	BackendMode string `json:"backendMode"`
 }

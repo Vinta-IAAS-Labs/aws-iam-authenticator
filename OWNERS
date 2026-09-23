@@ -1,19 +1,23 @@
 approvers:
-- nckturner
 - micahhausler
-- wongma7
-- jaypipes
-- jyotimahapatra
+- kmala
+- yue9944882
+- mengqiy
+- hakuna-matatah
+- ronaldngounou
 
 reviewers:
-- nckturner
 - micahhausler
-- justinsb
-- wongma7
-- jaypipes
-- jyotimahapatra
+- kmala
+- yue9944882
+- mengqiy
+- hakuna-matatah
+- ronaldngounou
 
 emeritus_approvers:
 - christopherhein
 - mattmoyer
 - mattlandis
+- jaypipes
+- nckturner
+- nnmin-aws

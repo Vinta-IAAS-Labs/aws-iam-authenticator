@@ -11,19 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-ARG image=public.ecr.aws/eks-distro-build-tooling/eks-distro-minimal-base-nonroot:2021-12-01-1638322424
-ARG golang_image=public.ecr.aws/eks-distro-build-tooling/golang:1.19-gcc
+ARG image=public.ecr.aws/eks-distro-build-tooling/eks-distro-minimal-base-nonroot:2026-03-10-1773177752.2023
+ARG golang_image=public.ecr.aws/eks-distro-build-tooling/golang:1.26.5
 
 FROM --platform=$BUILDPLATFORM $golang_image AS builder
 WORKDIR /go/src/github.com/kubernetes-sigs/aws-iam-authenticator
 COPY . .
-RUN go mod download
-RUN GOOS=$TARGETOS GOARCH=$TARGETARCH make bin
+RUN go version
+
+ARG TARGETOS TARGETARCH
+RUN GOPROXY=direct GOOS=$TARGETOS GOARCH=$TARGETARCH make bin
 RUN chown 65532 _output/bin/aws-iam-authenticator
 
-FROM public.ecr.aws/eks-distro/kubernetes/go-runner:v0.9.0-eks-1-21-4 as go-runner
+FROM --platform=$TARGETPLATFORM public.ecr.aws/eks-distro-build-tooling/go-runner:v0.18.0-go-1.26.5.2023 AS go-runner
 
-FROM $image
-COPY --from=go-runner /usr/local/bin/go-runner /usr/local/bin/go-runner
+FROM --platform=$TARGETPLATFORM $image
+COPY --from=go-runner /go-runner /usr/local/bin/go-runner
 COPY --from=builder /go/src/github.com/kubernetes-sigs/aws-iam-authenticator/_output/bin/aws-iam-authenticator /aws-iam-authenticator
 ENTRYPOINT ["/aws-iam-authenticator"]

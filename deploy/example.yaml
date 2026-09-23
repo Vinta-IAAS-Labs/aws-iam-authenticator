@@ -209,12 +209,12 @@ spec:
       # run on the host network (don't depend on CNI)
       hostNetwork: true
 
-      # run on each master node
+      # run on each control-plane node
       nodeSelector:
-        node-role.kubernetes.io/master: ""
+        node-role.kubernetes.io/control-plane: ""
       tolerations:
       - effect: NoSchedule
-        key: node-role.kubernetes.io/master
+        key: node-role.kubernetes.io/control-plane
       - key: CriticalAddonsOnly
         operator: Exists
 
@@ -227,7 +227,9 @@ spec:
       # - output (output kubeconfig to plug into your apiserver configuration, mounted from the host)
       containers:
       - name: aws-iam-authenticator
-        image: 602401143452.dkr.ecr.us-west-2.amazonaws.com/amazon/aws-iam-authenticator:v0.5.3
+        # Build your own image from source (make image) or use your organization's registry.
+        # See https://github.com/kubernetes-sigs/aws-iam-authenticator for build instructions.
+        image: <your-registry>/aws-iam-authenticator:<version>
         args:
         - server
         # uncomment if using EKS-Style ConfigMap

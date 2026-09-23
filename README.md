@@ -3,6 +3,20 @@
 A tool to use AWS IAM credentials to authenticate to a Kubernetes cluster.
 The initial work on this tool was driven by Heptio. The project receives contributions from multiple community engineers and is currently maintained by Heptio and Amazon EKS OSS Engineers.
 
+## Table of Contents
+
+- [Why do I want this?](#why-do-i-want-this)
+- [How do I use it?](#how-do-i-use-it)
+- [Kops Usage](#kops-usage)
+- [How does it work?](#how-does-it-work)
+- [What is a cluster ID?](#what-is-a-cluster-id)
+- [Specifying Credentials & Using AWS Profiles](#specifying-credentials--using-aws-profiles)
+- [API Authorization from Outside a Cluster](#api-authorization-from-outside-a-cluster)
+- [Troubleshooting](#troubleshooting)
+- [Full Configuration Format](#full-configuration-format)
+- [Development](#development)
+- [Community, discussion, contribution, and support](#community-discussion-contribution-and-support)
+
 ## Why do I want this?
 If you are an administrator running a Kubernetes cluster on AWS, you already need to manage AWS IAM credentials to provision and update the cluster.
 By using AWS IAM Authenticator for Kubernetes, you avoid having to manage a separate credential for Kubernetes access.
@@ -55,6 +69,19 @@ You can also skip this step and use:
 The server is meant to run on each of your master nodes as a DaemonSet with host networking so it can expose a localhost port.
 
 For a sample ConfigMap and DaemonSet configuration, see [`deploy/example.yaml`](./deploy/example.yaml).
+Before applying it, update these values for your cluster:
+ - Replace placeholder IAM ARNs (`arn:aws:iam::000000000000:...`) in `config.yaml`.
+ - Set `clusterID` to a unique value for your cluster.
+ - Verify the DaemonSet scheduling rules match your control-plane node labels/taints.
+
+Then deploy it:
+```sh
+kubectl apply -f deploy/example.yaml
+kubectl -n kube-system rollout status daemonset/aws-iam-authenticator
+kubectl -n kube-system get pods -l k8s-app=aws-iam-authenticator
+```
+
+Once the pod is running on a control-plane node, the `aws-iam-authenticator server` will create the webhook kubeconfig on the host at `/etc/kubernetes/aws-iam-authenticator/kubeconfig.yaml` (or the path configured via `--generate-kubeconfig`).
 
 #### (Optional) Pre-generate a certificate, key, and kubeconfig
 If you're building an automated installer, you can also pre-generate the certificate, key, and webhook kubeconfig files easily using `aws-iam-authenticator init`.
@@ -67,7 +94,7 @@ If you do not pre-generate files, `aws-iam-authenticator server` will generate t
 This works but requires that you restart your Kubernetes API server after installation.
 
 ### 3. Configure your API server to talk to the server
-The Kubernetes API integrates with AWS IAM Authenticator for Kubernetes using a [token authentication webhook](https://kubernetes.io/docs/admin/authentication/#webhook-token-authentication).
+The Kubernetes API integrates with AWS IAM Authenticator for Kubernetes using a [token authentication webhook](https://kubernetes.io/docs/reference/access-authn-authz/authentication/#webhook-token-authentication).
 When you run `aws-iam-authenticator server`, it will generate a webhook configuration file and save it onto the host filesystem.
 You'll need to add a single additional flag to your API server configuration:
 ```
@@ -158,13 +185,30 @@ useful if you're migrating from/to EKS and want to keep your mappings, or are
 running EKS in addition to some other AWS cluster(s) and want to have the same
 mappings in each.
 
-### 5. Set up kubectl to use authentication tokens provided by AWS IAM Authenticator for Kubernetes
+#### `DynamicFile`
+A local file specified by cfg.dynamicfilepath can serve as the backend. The file
+content is expected to be in exactly the same format as the EKSConfigMap. Whenever
+this file content changes, authenticator will automatically reload it.  This
+provides more flexibility on managing the ARN mappings.
 
-> This requires a 1.10+ `kubectl` binary to work. If you receive `Please enter Username:` when trying to use `kubectl` you need to update to the latest `kubectl`
+Check https://github.com/kubernetes-sigs/aws-iam-authenticator/blob/master/hack/dev/authenticator_with_dynamicfile_mode.yaml
+about how to configure the DynamicFile mode.
+
+Run `make e2e RUNNER=kind` to play with a kind cluster with DynamicFile mode enable.
+### 5. How to configure reservedPrefixConfig for Kubernetes usernames
+The aws-iam-authenticator can support reserved prefix for k8s username. If the reserved prefix is
+set, then the username with the reserved prefix will not be authenticated with the error
+"username must not begin with with the following prefixes:".
+
+Check https://github.com/kubernetes-sigs/aws-iam-authenticator/blob/master/hack/dev/authenticator_with_dynamicfile_mode.yaml
+about how to configure the reserved prefix.
+
+
+### 6. Set up kubectl to use authentication tokens provided by AWS IAM Authenticator for Kubernetes
 
 Finally, once the server is set up you'll want to authenticate.
 You will still need a `kubeconfig` that has the public data about your cluster (cluster CA certificate, endpoint address).
-The `users` section of your configuration, however, should include an exec section ([refer to the v1.10 docs](https://kubernetes.io/docs/admin/authentication/#client-go-credential-plugins))::
+The `users` section of your configuration, however, should include an exec section ([refer to the kubectl credential plugin docs](https://kubernetes.io/docs/reference/access-authn-authz/authentication/#client-go-credential-plugins)):
 ```yaml
 # [...]
 users:
@@ -186,7 +230,7 @@ This means the `kubeconfig` is entirely public data and can be shared across all
 It may make sense to upload it to a trusted public location such as AWS S3.
 
 Make sure you have the `aws-iam-authenticator` binary installed.
-You can install it with `go get -u -v sigs.k8s.io/aws-iam-authenticator/cmd/aws-iam-authenticator`.
+You can install it with `go install sigs.k8s.io/aws-iam-authenticator/cmd/aws-iam-authenticator@latest`.
 
 To authenticate, run `kubectl --kubeconfig /path/to/kubeconfig" [...]`.
 kubectl will `exec` the `aws-iam-authenticator` binary with the supplied params in your kubeconfig which will generate a token and pass it to the apiserver.
@@ -426,8 +470,12 @@ server:
 
   # map nodes that should conform to the username "system:node:<private-DNS>".  This
   # requires the authenticator to query the EC2 API in order to discover the private
-  # DNS of the EC2 instance originating the authentication request.  Optionally, you
-  # may specify a role that should be assumed before querying the EC2 API with the
+  # DNS of the EC2 instance originating the authentication request.
+  # {{EC2PrivateDNSName}} is resolved by using the session name as an EC2 instance
+  # ID and calling ec2:DescribeInstances. Note that if this role is assumed directly
+  # by an IAM User (not via federation), the user can set the session name to any
+  # instance ID, resolving another instance's private DNS and impersonating that node.
+  # Optionally, you may specify a role that should be assumed before querying the EC2 API with the
   # key "server.ec2DescribeInstancesRoleARN" (see above).
   - rolearn: arn:aws:iam::000000000000:role/KubernetesNode
     username: system:node:{{EC2PrivateDNSName}}
@@ -463,7 +511,7 @@ server:
     groups:
     - system:masters
 
-  # each mapUsers entry maps an IAM role to a static username and set of groups
+  # each mapUsers entry maps an IAM user to a static username and set of groups
   mapUsers:
   # map user IAM user Alice in 000000000000 to user "alice" in group "system:masters"
   - userarn: arn:aws:iam::000000000000:user/Alice

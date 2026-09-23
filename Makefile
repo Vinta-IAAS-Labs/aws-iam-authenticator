@@ -1,13 +1,36 @@
 default: bin/aws-iam-authenticator
 
+.PHONY: help
+help:
+	@echo "Available targets:"
+	@echo "  bin                  Build binary for current OS/arch"
+	@echo "  build-all-bins       Build binaries for all platforms"
+	@echo "  build-all-images     Build Docker images for all Linux architectures"
+	@echo "  image                Build Docker image for current arch"
+	@echo "  goreleaser           Build a local snapshot release (requires goreleaser)"
+	@echo "  test                 Run unit tests with coverage"
+	@echo "  integration          Run integration tests (requires AWS credentials)"
+	@echo "  e2e                  Run end-to-end tests: make e2e RUNNER=[kops|kind]"
+	@echo "  lint                 Run golangci-lint"
+	@echo "  update               Run all auto-fixers (gofmt, go mod tidy)"
+	@echo "  verify               Assert that 'make update' produces no diff (used in CI)"
+	@echo "  format               Check and fix Go formatting"
+	@echo "  codegen              Regenerate CRD client code"
+	@echo "  start-dev            Start local kind dev environment (requires ADMIN_ARN and AUTHENTICATOR_IMAGE)"
+	@echo "  stop-dev             Tear down dev environment (keep _output/dev/)"
+	@echo "  start-dev-dynamicfile  Start kind dev environment with DynamicFile backend (no env vars needed)"
+	@echo "  stop-dev-dynamicfile   Tear down DynamicFile dev environment (keep _output/dev/)"
+	@echo "  kill-dev             Tear down dev environment and remove generated config"
+	@echo "  checksums            Generate SHA256 checksums for all release binaries"
+	@echo "  clean                Remove build output directory"
+
 PKG ?= sigs.k8s.io/aws-iam-authenticator
 GORELEASER := $(shell command -v goreleaser 2> /dev/null)
 
-VERSION ?= v0.6.0
+VERSION ?= $(shell $(shell pwd)/hack/get-version.sh)
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
 GOPROXY ?= $(shell go env GOPROXY)
-SOURCES := $(shell find . -name '*.go')
 GIT_COMMIT ?= $(shell git rev-parse HEAD)
 BUILD_DATE ?= $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 BUILD_DATE_STRIPPED := $(subst -,,$(subst :,,$(BUILD_DATE)))
@@ -17,7 +40,7 @@ CHECKSUM_FILE ?= $(OUTPUT)/bin/authenticator_$(VERSION)_checksums.txt
 # Architectures for binary builds
 BIN_ARCH_LINUX ?= amd64 arm64
 BIN_ARCH_WINDOWS ?= amd64
-BIN_ARCH_DARWIN ?= amd64
+BIN_ARCH_DARWIN ?= amd64 arm64
 
 #CI is defined in test-infra https://github.com/kubernetes/test-infra/blob/2e3dd84399745eb49cef69afc3ed5bded8a6580c/prow/pod-utils/downwardapi/jobspec.go#L89
 # and passed in when running on github prow
@@ -55,13 +78,15 @@ $(CHECKSUM_FILE): build-all-bins
 	@echo $(ALL_BIN_TARGETS)
 	$(foreach target,$(ALL_BIN_TARGETS),$(call checksum,$(target),$(CHECKSUM_FILE)))
 
-$(OUTPUT)/bin/%: $(SOURCES)
+$(OUTPUT)/bin/%:
 	GO111MODULE=on \
 		CGO_ENABLED=0 \
 		GOOS=$(GOOS) \
 		GOARCH=$(GOARCH) \
 		GOPROXY=$(GOPROXY) \
 		go build \
+		-trimpath \
+		--tags "$(GOTAGS)" \
 		-o=$@ \
 		-ldflags="-w -s -X $(PKG)/pkg.Version=$(VERSION) -X $(PKG)/pkg.BuildDate=$(BUILD_DATE) -X $(PKG)/pkg.CommitID=$(GIT_COMMIT)" \
 		./cmd/aws-iam-authenticator/
@@ -77,28 +102,43 @@ $(MAKE) $(OUTPUT)/bin/aws-iam-authenticator_$(VERSION)_$(1)_$(2)$(3) GOOS=$(1) G
 
 endef
 
+# Function build-image
+# Parameters:
+# 1: Target architecture
+define build-image
+$(MAKE) .image-linux-$(1)
+
+endef
+
 .PHONY: build-all-bins
 build-all-bins:
 	$(foreach arch,$(BIN_ARCH_LINUX),$(call build-bin,linux,$(arch),))
 	$(foreach arch,$(BIN_ARCH_WINDOWS),$(call build-bin,windows,$(arch),.exe))
 	$(foreach arch,$(BIN_ARCH_DARWIN),$(call build-bin,darwin,$(arch),))
 
+.PHONY: build-all-images
+build-all-images:
+	$(foreach arch,$(BIN_ARCH_LINUX),$(call build-image,$(arch)))
+
 .PHONY: image
-image:
-	docker buildx build --output=type=docker --platform linux/amd64 \
-		--tag aws-iam-authenticator:$(VERSION)_$(GIT_COMMIT)_$(BUILD_DATE_STRIPPED) .
+image: .image-linux-$(GOARCH)
+
+.PHONY: .image-linux-%
+.image-linux-%:
+	docker buildx build --output=type=docker --platform linux/$* \
+		--build-arg golang_image=$(shell hack/setup-go.sh) \
+		--tag aws-iam-authenticator:$(VERSION)_$(GIT_COMMIT)_$(BUILD_DATE_STRIPPED)-linux_$* .
 
 .PHONY: goreleaser
 goreleaser:
 ifndef GORELEASER
-	$(error "goreleaser not found (`go get -u -v github.com/goreleaser/goreleaser` to fix)")
+	$(error "goreleaser not found (`go install github.com/goreleaser/goreleaser/v2@latest` to fix)")
 endif
-	$(GORELEASER) --skip-publish --rm-dist --snapshot
+	$(GORELEASER) release --skip=publish --clean --snapshot
 
 .PHONY: test
 test:
-	go test -v -coverprofile=coverage.out -race $(PKG)/pkg/...
-	go tool cover -html=coverage.out -o coverage.html
+	./hack/test-unit.sh
 
 .PHONY: integration
 integration:
@@ -115,6 +155,23 @@ else ifeq ($(RUNNER),kind)
 else
 	echo "make e2e RUNNER=[kops|kind]"
 endif
+
+.PHONY: lint
+lint:
+	golangci-lint run
+
+# update runs all auto-fixers. Run this before submitting a PR.
+.PHONY: update
+update:
+	gofmt -s -w .
+	go mod tidy
+	go mod tidy -C ./tests/e2e
+	go mod tidy -C ./tests/integration
+
+# verify checks that update produces no diff (used in CI).
+.PHONY: verify
+verify: update
+	@git diff --exit-code || (echo "\nRun 'make update' and commit the results." && exit 1)
 
 .PHONY: format
 format:
@@ -144,11 +201,11 @@ start-dev: bin
 stop-dev:
 	./hack/stop-dev-env.sh
 
-.PHONY: start-dev-dynamicfile-e2e
+.PHONY: start-dev-dynamicfile
 start-dev-dynamicfile:
 	./hack/start-dev-env-dynamicfile.sh
 
-.PHONY: stop-dev-dynamicfile-e2e
+.PHONY: stop-dev-dynamicfile
 stop-dev-dynamicfile:
 	./hack/stop-dev-env.sh
 

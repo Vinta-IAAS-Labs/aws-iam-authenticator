@@ -14,25 +14,21 @@ limitations under the License.
 package e2e
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"time"
 
-	"bytes"
-	"io/ioutil"
-	yamlutil "k8s.io/apimachinery/pkg/util/yaml"
-
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	batchv1 "k8s.io/api/batch/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
-	clientset "k8s.io/client-go/kubernetes"
-	restclientset "k8s.io/client-go/rest"
+	yamlutil "k8s.io/apimachinery/pkg/util/yaml"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/kubernetes/test/e2e/framework"
 )
 
 const (
@@ -41,20 +37,21 @@ const (
 	testTimeout  = 300 * time.Second
 )
 
-var _ = Describe("[apiserver] [Disruptive] the apiserver", func() {
-	var (
-		cs  clientset.Interface
-		cfg *restclientset.Config
-	)
+var _ = SIGDescribe("apiserver", Label("Disruptive"), func() {
+	var cs kubernetes.Interface
+
+	BeforeEach(func() {
+		cfg, err := clientcmd.BuildConfigFromFlags("", kubeConfig)
+		Expect(err).NotTo(HaveOccurred())
+		cs, err = kubernetes.NewForConfig(cfg)
+		Expect(err).NotTo(HaveOccurred())
+	})
 
 	When("the manifest changes", func() {
 		BeforeEach(func() {
-			cfg, _ = clientcmd.BuildConfigFromFlags("", framework.TestContext.KubeConfig)
-			cs, _ = clientset.NewForConfig(cfg)
-
 			jobPath := filepath.Join(os.Getenv("BASE_DIR"), "apiserver-restart.yaml")
 
-			b, _ := ioutil.ReadFile(jobPath)
+			b, _ := os.ReadFile(jobPath)
 			decoder := yamlutil.NewYAMLOrJSONDecoder(bytes.NewReader(b), 100)
 			jobSpec := &batchv1.Job{}
 			_ = decoder.Decode(&jobSpec)
@@ -68,12 +65,10 @@ var _ = Describe("[apiserver] [Disruptive] the apiserver", func() {
 				_, pingErr := cs.CoreV1().
 					Nodes().
 					List(context.TODO(), metav1.ListOptions{})
-
 				if pingErr == nil {
 					return false, nil
-				} else {
-					return true, nil
 				}
+				return true, nil
 			})
 
 			if err != nil {
@@ -91,16 +86,13 @@ var _ = Describe("[apiserver] [Disruptive] the apiserver", func() {
 				res, pingErr := cs.CoreV1().
 					Nodes().
 					List(context.TODO(), metav1.ListOptions{})
-
 				if pingErr == nil {
 					fmt.Printf("after %ds: apiserver back up: %v nodes\n", int(time.Since(startTime).Seconds()), len(res.Items))
 					return true, nil
-				} else {
-					fmt.Printf("after %ds: %v\n", int(time.Since(startTime).Seconds()), pingErr)
-					return false, nil
 				}
+				fmt.Printf("after %ds: %v\n", int(time.Since(startTime).Seconds()), pingErr)
+				return false, nil
 			})
-
 			Expect(err).ToNot(HaveOccurred())
 		})
 	})

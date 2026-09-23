@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"sigs.k8s.io/aws-iam-authenticator/pkg/config"
+	"sigs.k8s.io/aws-iam-authenticator/pkg/token"
 )
 
 func init() {
@@ -25,6 +26,12 @@ func newConfig() config.Config {
 					AccountID:         "012345678910",
 				},
 				Username: "cookie-cutter",
+				Groups:   []string{"system:masters"},
+			},
+			{
+				// test compatibility with eks
+				RoleARN:  "arn:aws:sts::012345678910:assumed-role/test-assumed-role/session-name",
+				Username: "test",
 				Groups:   []string{"system:masters"},
 			},
 		},
@@ -57,6 +64,11 @@ func TestNewFileMapper(t *testing.T) {
 				Username: "cookie-cutter",
 				Groups:   []string{"system:masters"},
 			},
+			"arn:aws:iam::012345678910:role/test-assumed-role": {
+				RoleARN:  "arn:aws:iam::012345678910:role/test-assumed-role",
+				Username: "test",
+				Groups:   []string{"system:masters"},
+			},
 		},
 		userMap: map[string]config.UserMapping{
 			"arn:aws:iam::012345678910:user/donald": {
@@ -87,12 +99,15 @@ func TestMap(t *testing.T) {
 	}
 
 	identityArn := "arn:aws:iam::012345678910:role/test-role"
+	identity := token.Identity{
+		CanonicalARN: identityArn,
+	}
 	expected := &config.IdentityMapping{
 		IdentityARN: identityArn,
 		Username:    "shreyas",
 		Groups:      []string{"system:masters"},
 	}
-	actual, err := fm.Map(identityArn)
+	actual, err := fm.Map(&identity)
 	if err != nil {
 		t.Errorf("Could not map %s: %s", identityArn, err)
 	}
@@ -101,12 +116,15 @@ func TestMap(t *testing.T) {
 	}
 
 	identityArn = "arn:aws:iam::012345678910:role/awsreservedsso_cookiecutterpermissions_123123123"
+	identity = token.Identity{
+		CanonicalARN: identityArn,
+	}
 	expected = &config.IdentityMapping{
 		IdentityARN: identityArn,
 		Username:    "cookie-cutter",
 		Groups:      []string{"system:masters"},
 	}
-	actual, err = fm.Map(identityArn)
+	actual, err = fm.Map(&identity)
 	if err != nil {
 		t.Errorf("Could not map %s: %s", identityArn, err)
 	}
@@ -115,12 +133,15 @@ func TestMap(t *testing.T) {
 	}
 
 	identityArn = "arn:aws:iam::012345678910:user/donald"
+	identity = token.Identity{
+		CanonicalARN: identityArn,
+	}
 	expected = &config.IdentityMapping{
 		IdentityARN: identityArn,
 		Username:    "donald",
 		Groups:      []string{"system:masters"},
 	}
-	actual, err = fm.Map(identityArn)
+	actual, err = fm.Map(&identity)
 	if err != nil {
 		t.Errorf("Could not map %s: %s", identityArn, err)
 	}

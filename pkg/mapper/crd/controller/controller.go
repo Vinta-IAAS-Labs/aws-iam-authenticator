@@ -67,7 +67,7 @@ type Controller struct {
 	iamMappingsIndex cache.Indexer
 
 	// workqueue implements a FIFO queue used for processing items
-	workqueue workqueue.RateLimitingInterface
+	workqueue workqueue.TypedRateLimitingInterface[any]
 	// recorder implements the Event recorder interface for logging events.
 	recorder record.EventRecorder
 }
@@ -93,7 +93,7 @@ func New(
 		iamclientset:      iamclientset,
 		iamMappingLister:  iamMappingInformer.Lister(),
 		iamMappingsSynced: iamMappingInformer.Informer().HasSynced,
-		workqueue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "IAMIdentityMappings"),
+		workqueue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[any](), "IAMIdentityMappings"),
 		recorder:          recorder,
 	}
 
@@ -102,12 +102,14 @@ func New(
 	// canonical ARNs, we're ignoring deletes because all checks for roles happen
 	// using the in-memory cache which is updated automatically on deletes no further
 	// actions are necessary
-	iamMappingInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	if _, err := iamMappingInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: controller.enqueueIAMIdentityMapping,
-		UpdateFunc: func(old, new interface{}) {
-			controller.enqueueIAMIdentityMapping(new)
+		UpdateFunc: func(_, newObj interface{}) {
+			controller.enqueueIAMIdentityMapping(newObj)
 		},
-	})
+	}); err != nil {
+		logrus.WithError(err).Fatal("error adding event handler")
+	}
 
 	err := iamMappingInformer.Informer().GetIndexer().AddIndexers(cache.Indexers{
 		"canonicalARN": IndexIAMIdentityMappingByCanonicalArn,
@@ -191,7 +193,7 @@ func (c *Controller) syncHandler(key string) (err error) {
 	_, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("invalid resource key %s", key))
-		return nil
+		return nil //nolint:nilerr // invalid keys should not be retried; log and drop
 	}
 
 	iamIdentityMapping, err := c.iamMappingLister.Get(name)
@@ -207,7 +209,7 @@ func (c *Controller) syncHandler(key string) (err error) {
 	if iamIdentityMapping.Spec.ARN != "" {
 		iamIdentityMappingCopy := iamIdentityMapping.DeepCopy()
 
-		canonicalizedARN, err := arn.Canonicalize(strings.ToLower(iamIdentityMapping.Spec.ARN))
+		_, canonicalizedARN, err := arn.Canonicalize(strings.ToLower(iamIdentityMapping.Spec.ARN))
 		if err != nil {
 			return err
 		}

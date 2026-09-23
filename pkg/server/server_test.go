@@ -2,9 +2,10 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -27,7 +28,7 @@ import (
 
 func verifyBodyContains(t *testing.T, resp *httptest.ResponseRecorder, s string) {
 	t.Helper()
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("Failed to read body from ResponseRecorder, this should not happen")
 	}
@@ -38,7 +39,7 @@ func verifyBodyContains(t *testing.T, resp *httptest.ResponseRecorder, s string)
 
 func verifyAuthResult(t *testing.T, resp *httptest.ResponseRecorder, expected authenticationv1beta1.TokenReview) {
 	t.Helper()
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("Failed to read body from ResponseRecorder, this should not happen.")
 	}
@@ -71,11 +72,11 @@ type testEC2Provider struct {
 	burst int
 }
 
-func (p *testEC2Provider) GetPrivateDNSName(id string) (string, error) {
+func (p *testEC2Provider) GetPrivateDNSName(_ context.Context, _ string) (string, error) {
 	return p.name, nil
 }
 
-func (p *testEC2Provider) StartEc2DescribeBatchProcessing() {}
+func (p *testEC2Provider) StartEc2DescribeBatchProcessing(_ context.Context) {}
 
 func newTestEC2Provider(name string, qps int, burst int) *testEC2Provider {
 	return &testEC2Provider{
@@ -117,7 +118,7 @@ func createIndexer() cache.Indexer {
 // Count of expected metrics
 type validateOpts struct {
 	// The expected number of latency entries for each label.
-	malformed, invalidToken, unknownUser, success, stsError uint64
+	malformed, invalidToken, unknownUser, success, stsError, stsThrottling uint64
 }
 
 func checkHistogramSampleCount(t *testing.T, name string, actual, expected uint64) {
@@ -135,7 +136,7 @@ func validateMetrics(t *testing.T, opts validateOpts) {
 	}
 	for _, m := range metricFamilies {
 		if strings.HasPrefix(m.GetName(), "aws_iam_authenticator_authenticate_latency_seconds") {
-			var actualSuccess, actualMalformed, actualInvalid, actualUnknown, actualSTSError uint64
+			var actualSuccess, actualMalformed, actualInvalid, actualUnknown, actualSTSError, actualSTSThrottling uint64
 			for _, metric := range m.GetMetric() {
 				if len(metric.Label) != 1 {
 					t.Fatalf("Expected 1 label for metric.  Got %+v", metric.Label)
@@ -155,6 +156,8 @@ func validateMetrics(t *testing.T, opts validateOpts) {
 					actualUnknown = metric.GetHistogram().GetSampleCount()
 				case metrics.STSError:
 					actualSTSError = metric.GetHistogram().GetSampleCount()
+				case metrics.STSThrottling:
+					actualSTSThrottling = metric.GetHistogram().GetSampleCount()
 				default:
 					t.Errorf("Unknown result for latency label: %s", *label.Value)
 
@@ -165,6 +168,47 @@ func validateMetrics(t *testing.T, opts validateOpts) {
 			checkHistogramSampleCount(t, metrics.Invalid, actualInvalid, opts.invalidToken)
 			checkHistogramSampleCount(t, metrics.Unknown, actualUnknown, opts.unknownUser)
 			checkHistogramSampleCount(t, metrics.STSError, actualSTSError, opts.stsError)
+			checkHistogramSampleCount(t, metrics.STSThrottling, actualSTSThrottling, opts.stsThrottling)
+		}
+	}
+}
+
+func TestReservedPrefixExists(t *testing.T) {
+	cases := []struct {
+		username     string
+		reservedList []string
+		want         bool
+	}{
+		{
+			"system:masters",
+			[]string{"aws:", "eks:", "amazon:", "iam:", "system:"},
+			true,
+		},
+		{
+			"test",
+			[]string{"aws:", "eks:", "amazon:", "iam:", "system:"},
+			false,
+		},
+		{
+			"eksb:test",
+			[]string{"aws:", "eks:", "amazon:", "iam:", "system:"},
+			false,
+		},
+		{
+			"eks:test",
+			[]string{"aws:", "eks:", "amazon:", "iam:", "system:"},
+			true,
+		},
+	}
+	for _, c := range cases {
+		if got := ReservedPrefixExists(c.username, c.reservedList); got != c.want {
+			t.Errorf(
+				"Unexpected result: ReservedPrefixExists(%v,%v): got: %t, wanted %t",
+				c.username,
+				c.reservedList,
+				got,
+				c.want,
+			)
 		}
 	}
 }
@@ -173,7 +217,7 @@ func TestAuthenticateNonPostError(t *testing.T) {
 	resp := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "http://k8s.io/authenticate", nil)
 	h := setup(nil)
-	h.authenticateEndpoint(resp, req)
+	h.authenticateEndpoint(context.TODO(), resp, req)
 	if resp.Code != http.StatusMethodNotAllowed {
 		t.Errorf("Expected status code %d, was %d", http.StatusMethodNotAllowed, resp.Code)
 	}
@@ -185,7 +229,7 @@ func TestAuthenticateNonPostErrorCRD(t *testing.T) {
 	resp := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "http://k8s.io/authenticate", nil)
 	h := setup(nil)
-	h.authenticateEndpoint(resp, req)
+	h.authenticateEndpoint(context.TODO(), resp, req)
 	if resp.Code != http.StatusMethodNotAllowed {
 		t.Errorf("Expected status code %d, was %d", http.StatusMethodNotAllowed, resp.Code)
 	}
@@ -197,7 +241,7 @@ func TestAuthenticateEmptyBody(t *testing.T) {
 	resp := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "http://k8s.io/authenticate", nil)
 	h := setup(nil)
-	h.authenticateEndpoint(resp, req)
+	h.authenticateEndpoint(context.TODO(), resp, req)
 	if resp.Code != http.StatusBadRequest {
 		t.Errorf("Expected status code %d, was %d", http.StatusBadRequest, resp.Code)
 	}
@@ -209,7 +253,7 @@ func TestAuthenticateEmptyBodyCRD(t *testing.T) {
 	resp := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "http://k8s.io/authenticate", nil)
 	h := setup(nil)
-	h.authenticateEndpoint(resp, req)
+	h.authenticateEndpoint(context.TODO(), resp, req)
 	if resp.Code != http.StatusBadRequest {
 		t.Errorf("Expected status code %d, was %d", http.StatusBadRequest, resp.Code)
 	}
@@ -221,7 +265,7 @@ func TestAuthenticateUnableToDecodeBody(t *testing.T) {
 	resp := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "http://k8s.io/authenticate", strings.NewReader("not valid json"))
 	h := setup(nil)
-	h.authenticateEndpoint(resp, req)
+	h.authenticateEndpoint(context.TODO(), resp, req)
 	if resp.Code != http.StatusBadRequest {
 		t.Errorf("Expected status code %d, was %d", http.StatusBadRequest, resp.Code)
 	}
@@ -233,7 +277,7 @@ func TestAuthenticateUnableToDecodeBodyCRD(t *testing.T) {
 	resp := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "http://k8s.io/authenticate", strings.NewReader("not valid json"))
 	h := setup(nil)
-	h.authenticateEndpoint(resp, req)
+	h.authenticateEndpoint(context.TODO(), resp, req)
 	if resp.Code != http.StatusBadRequest {
 		t.Errorf("Expected status code %d, was %d", http.StatusBadRequest, resp.Code)
 	}
@@ -241,7 +285,7 @@ func TestAuthenticateUnableToDecodeBodyCRD(t *testing.T) {
 	validateMetrics(t, validateOpts{malformed: 1})
 }
 
-func testIsLoggableIdentity(t *testing.T) {
+func TestIsLoggableIdentity(t *testing.T) {
 	h := &handler{scrubbedAccounts: []string{"111122223333", "012345678901"}}
 
 	cases := []struct {
@@ -295,7 +339,7 @@ func TestAuthenticateVerifierError(t *testing.T) {
 	}
 	req := httptest.NewRequest("POST", "http://k8s.io/authenticate", bytes.NewReader(data))
 	h := setup(&testVerifier{err: errors.New("There was an error")})
-	h.authenticateEndpoint(resp, req)
+	h.authenticateEndpoint(context.TODO(), resp, req)
 	if resp.Code != http.StatusForbidden {
 		t.Errorf("Expected status code %d, was %d", http.StatusForbidden, resp.Code)
 	}
@@ -316,12 +360,33 @@ func TestAuthenticateVerifierErrorCRD(t *testing.T) {
 	}
 	req := httptest.NewRequest("POST", "http://k8s.io/authenticate", bytes.NewReader(data))
 	h := setup(&testVerifier{err: errors.New("There was an error")})
-	h.authenticateEndpoint(resp, req)
+	h.authenticateEndpoint(context.TODO(), resp, req)
 	if resp.Code != http.StatusForbidden {
 		t.Errorf("Expected status code %d, was %d", http.StatusForbidden, resp.Code)
 	}
 	verifyBodyContains(t, resp, string(tokenReviewDenyJSON))
 	validateMetrics(t, validateOpts{invalidToken: 1})
+}
+
+func TestAuthenticateVerifierSTSThrottling(t *testing.T) {
+	resp := httptest.NewRecorder()
+
+	data, err := json.Marshal(authenticationv1beta1.TokenReview{
+		Spec: authenticationv1beta1.TokenReviewSpec{
+			Token: "token",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Could not marshal in put data: %v", err)
+	}
+	req := httptest.NewRequest("POST", "http://k8s.io/authenticate", bytes.NewReader(data))
+	h := setup(&testVerifier{err: token.STSThrottling{}})
+	h.authenticateEndpoint(context.TODO(), resp, req)
+	if resp.Code != http.StatusTooManyRequests {
+		t.Errorf("Expected status code %d, was %d", http.StatusTooManyRequests, resp.Code)
+	}
+	verifyBodyContains(t, resp, string(tokenReviewDenyJSON))
+	validateMetrics(t, validateOpts{stsThrottling: 1})
 }
 
 func TestAuthenticateVerifierSTSError(t *testing.T) {
@@ -337,7 +402,7 @@ func TestAuthenticateVerifierSTSError(t *testing.T) {
 	}
 	req := httptest.NewRequest("POST", "http://k8s.io/authenticate", bytes.NewReader(data))
 	h := setup(&testVerifier{err: token.NewSTSError("There was an error")})
-	h.authenticateEndpoint(resp, req)
+	h.authenticateEndpoint(context.TODO(), resp, req)
 	if resp.Code != http.StatusForbidden {
 		t.Errorf("Expected status code %d, was %d", http.StatusForbidden, resp.Code)
 	}
@@ -358,7 +423,7 @@ func TestAuthenticateVerifierSTSErrorCRD(t *testing.T) {
 	}
 	req := httptest.NewRequest("POST", "http://k8s.io/authenticate", bytes.NewReader(data))
 	h := setup(&testVerifier{err: token.NewSTSError("There was an error")})
-	h.authenticateEndpoint(resp, req)
+	h.authenticateEndpoint(context.TODO(), resp, req)
 	if resp.Code != http.StatusForbidden {
 		t.Errorf("Expected status code %d, was %d", http.StatusForbidden, resp.Code)
 	}
@@ -385,7 +450,7 @@ func TestAuthenticateVerifierNotMapped(t *testing.T) {
 		UserID:       "",
 		SessionName:  "",
 	}})
-	h.authenticateEndpoint(resp, req)
+	h.authenticateEndpoint(context.TODO(), resp, req)
 	if resp.Code != http.StatusForbidden {
 		t.Errorf("Expected status code %d, was %d", http.StatusForbidden, resp.Code)
 	}
@@ -412,7 +477,7 @@ func TestAuthenticateVerifierNotMappedCRD(t *testing.T) {
 		UserID:       "",
 		SessionName:  "",
 	}})
-	h.authenticateEndpoint(resp, req)
+	h.authenticateEndpoint(context.TODO(), resp, req)
 	if resp.Code != http.StatusForbidden {
 		t.Errorf("Expected status code %d, was %d", http.StatusForbidden, resp.Code)
 	}
@@ -441,14 +506,17 @@ func TestAuthenticateVerifierRoleMapping(t *testing.T) {
 		AccessKeyID:  "ABCDEF",
 	}
 	h := setup(&testVerifier{err: nil, identity: identity})
-	h.mappers = []mapper.Mapper{file.NewFileMapperWithMaps(map[string]config.RoleMapping{
-		"arn:aws:iam::0123456789012:role/test": config.RoleMapping{
-			RoleARN:  "arn:aws:iam::0123456789012:role/Test",
-			Username: "TestUser",
-			Groups:   []string{"sys:admin", "listers"},
-		},
-	}, nil, nil)}
-	h.authenticateEndpoint(resp, req)
+	h.backendMapper = BackendMapper{
+		mappers: []mapper.Mapper{file.NewFileMapperWithMaps(map[string]config.RoleMapping{
+			"arn:aws:iam::0123456789012:role/test": {
+				RoleARN:  "arn:aws:iam::0123456789012:role/Test",
+				Username: "TestUser",
+				Groups:   []string{"sys:admin", "listers"},
+			},
+		}, nil, nil)},
+		mapperStopCh: make(chan struct{}),
+	}
+	h.authenticateEndpoint(context.TODO(), resp, req)
 	if resp.Code != http.StatusOK {
 		t.Errorf("Expected status code %d, was %d", http.StatusOK, resp.Code)
 	}
@@ -457,10 +525,12 @@ func TestAuthenticateVerifierRoleMapping(t *testing.T) {
 		"aws-iam-authenticator:0123456789012:Test",
 		[]string{"sys:admin", "listers"},
 		map[string]authenticationv1beta1.ExtraValue{
-			"arn":          authenticationv1beta1.ExtraValue{"arn:aws:iam::0123456789012:role/Test"},
-			"canonicalArn": authenticationv1beta1.ExtraValue{"arn:aws:iam::0123456789012:role/Test"},
-			"sessionName":  authenticationv1beta1.ExtraValue{"TestSession"},
-			"accessKeyId":  authenticationv1beta1.ExtraValue{"ABCDEF"},
+			"arn":          {"arn:aws:iam::0123456789012:role/Test"},
+			"canonicalArn": {"arn:aws:iam::0123456789012:role/Test"},
+			"sessionName":  {"TestSession"},
+			"accessKeyId":  {"ABCDEF"},
+			"principalId":  {"Test"},
+			"sigs.k8s.io/aws-iam-authenticator/principalId": {"Test"},
 		}))
 	validateMetrics(t, validateOpts{success: 1})
 }
@@ -485,9 +555,14 @@ func TestAuthenticateVerifierRoleMappingCRD(t *testing.T) {
 		SessionName:  "TestSession",
 	}})
 	indexer := createIndexer()
-	indexer.Add(newIAMIdentityMapping("arn:aws:iam::0123456789012:role/Test", "arn:aws:iam::0123456789012:role/test", "TestUser", []string{"sys:admin", "listers"}))
-	h.mappers = []mapper.Mapper{crd.NewCRDMapperWithIndexer(indexer)}
-	h.authenticateEndpoint(resp, req)
+	if err := indexer.Add(newIAMIdentityMapping("arn:aws:iam::0123456789012:role/Test", "arn:aws:iam::0123456789012:role/test", "TestUser", []string{"sys:admin", "listers"})); err != nil {
+		t.Fatalf("Could not add IAM identity mapping: %v", err)
+	}
+	h.backendMapper = BackendMapper{
+		mappers:      []mapper.Mapper{crd.NewCRDMapperWithIndexer(indexer)},
+		mapperStopCh: make(chan struct{}),
+	}
+	h.authenticateEndpoint(context.TODO(), resp, req)
 	if resp.Code != http.StatusOK {
 		t.Errorf("Expected status code %d, was %d", http.StatusOK, resp.Code)
 	}
@@ -496,10 +571,12 @@ func TestAuthenticateVerifierRoleMappingCRD(t *testing.T) {
 		"aws-iam-authenticator:0123456789012:Test",
 		[]string{"sys:admin", "listers"},
 		map[string]authenticationv1beta1.ExtraValue{
-			"arn":          authenticationv1beta1.ExtraValue{"arn:aws:iam::0123456789012:role/Test"},
-			"canonicalArn": authenticationv1beta1.ExtraValue{"arn:aws:iam::0123456789012:role/Test"},
-			"sessionName":  authenticationv1beta1.ExtraValue{"TestSession"},
-			"accessKeyId":  authenticationv1beta1.ExtraValue{""},
+			"arn":          {"arn:aws:iam::0123456789012:role/Test"},
+			"canonicalArn": {"arn:aws:iam::0123456789012:role/Test"},
+			"sessionName":  {"TestSession"},
+			"accessKeyId":  {""},
+			"principalId":  {"Test"},
+			"sigs.k8s.io/aws-iam-authenticator/principalId": {"Test"},
 		}))
 	validateMetrics(t, validateOpts{success: 1})
 }
@@ -523,14 +600,17 @@ func TestAuthenticateVerifierUserMapping(t *testing.T) {
 		UserID:       "Test",
 		SessionName:  "TestSession",
 	}})
-	h.mappers = []mapper.Mapper{file.NewFileMapperWithMaps(nil, map[string]config.UserMapping{
-		"arn:aws:iam::0123456789012:user/test": config.UserMapping{
-			UserARN:  "arn:aws:iam::0123456789012:user/Test",
-			Username: "TestUser",
-			Groups:   []string{"sys:admin", "listers"},
-		},
-	}, nil)}
-	h.authenticateEndpoint(resp, req)
+	h.backendMapper = BackendMapper{
+		mappers: []mapper.Mapper{file.NewFileMapperWithMaps(nil, map[string]config.UserMapping{
+			"arn:aws:iam::0123456789012:user/test": {
+				UserARN:  "arn:aws:iam::0123456789012:user/Test",
+				Username: "TestUser",
+				Groups:   []string{"sys:admin", "listers"},
+			},
+		}, nil)},
+		mapperStopCh: make(chan struct{}),
+	}
+	h.authenticateEndpoint(context.TODO(), resp, req)
 	if resp.Code != http.StatusOK {
 		t.Errorf("Expected status code %d, was %d", http.StatusOK, resp.Code)
 	}
@@ -539,10 +619,12 @@ func TestAuthenticateVerifierUserMapping(t *testing.T) {
 		"aws-iam-authenticator:0123456789012:Test",
 		[]string{"sys:admin", "listers"},
 		map[string]authenticationv1beta1.ExtraValue{
-			"arn":          authenticationv1beta1.ExtraValue{"arn:aws:iam::0123456789012:user/Test"},
-			"canonicalArn": authenticationv1beta1.ExtraValue{"arn:aws:iam::0123456789012:user/Test"},
-			"sessionName":  authenticationv1beta1.ExtraValue{"TestSession"},
-			"accessKeyId":  authenticationv1beta1.ExtraValue{""},
+			"arn":          {"arn:aws:iam::0123456789012:user/Test"},
+			"canonicalArn": {"arn:aws:iam::0123456789012:user/Test"},
+			"sessionName":  {"TestSession"},
+			"accessKeyId":  {""},
+			"principalId":  {"Test"},
+			"sigs.k8s.io/aws-iam-authenticator/principalId": {"Test"},
 		}))
 	validateMetrics(t, validateOpts{success: 1})
 }
@@ -567,9 +649,14 @@ func TestAuthenticateVerifierUserMappingCRD(t *testing.T) {
 		SessionName:  "TestSession",
 	}})
 	indexer := createIndexer()
-	indexer.Add(newIAMIdentityMapping("arn:aws:iam::0123456789012:user/Test", "arn:aws:iam::0123456789012:user/test", "TestUser", []string{"sys:admin", "listers"}))
-	h.mappers = []mapper.Mapper{crd.NewCRDMapperWithIndexer(indexer)}
-	h.authenticateEndpoint(resp, req)
+	if err := indexer.Add(newIAMIdentityMapping("arn:aws:iam::0123456789012:user/Test", "arn:aws:iam::0123456789012:user/test", "TestUser", []string{"sys:admin", "listers"})); err != nil {
+		t.Fatalf("Could not add IAM identity mapping: %v", err)
+	}
+	h.backendMapper = BackendMapper{
+		mappers:      []mapper.Mapper{crd.NewCRDMapperWithIndexer(indexer)},
+		mapperStopCh: make(chan struct{}),
+	}
+	h.authenticateEndpoint(context.TODO(), resp, req)
 	if resp.Code != http.StatusOK {
 		t.Errorf("Expected status code %d, was %d", http.StatusOK, resp.Code)
 	}
@@ -578,10 +665,12 @@ func TestAuthenticateVerifierUserMappingCRD(t *testing.T) {
 		"aws-iam-authenticator:0123456789012:Test",
 		[]string{"sys:admin", "listers"},
 		map[string]authenticationv1beta1.ExtraValue{
-			"arn":          authenticationv1beta1.ExtraValue{"arn:aws:iam::0123456789012:user/Test"},
-			"canonicalArn": authenticationv1beta1.ExtraValue{"arn:aws:iam::0123456789012:user/Test"},
-			"sessionName":  authenticationv1beta1.ExtraValue{"TestSession"},
-			"accessKeyId":  authenticationv1beta1.ExtraValue{""},
+			"arn":          {"arn:aws:iam::0123456789012:user/Test"},
+			"canonicalArn": {"arn:aws:iam::0123456789012:user/Test"},
+			"sessionName":  {"TestSession"},
+			"accessKeyId":  {""},
+			"principalId":  {"Test"},
+			"sigs.k8s.io/aws-iam-authenticator/principalId": {"Test"},
 		}))
 	validateMetrics(t, validateOpts{success: 1})
 }
@@ -605,10 +694,13 @@ func TestAuthenticateVerifierAccountMappingForUser(t *testing.T) {
 		UserID:       "Test",
 		SessionName:  "TestSession",
 	}})
-	h.mappers = []mapper.Mapper{file.NewFileMapperWithMaps(nil, nil, map[string]bool{
-		"0123456789012": true,
-	})}
-	h.authenticateEndpoint(resp, req)
+	h.backendMapper = BackendMapper{
+		mappers: []mapper.Mapper{file.NewFileMapperWithMaps(nil, nil, map[string]bool{
+			"0123456789012": true,
+		})},
+		mapperStopCh: make(chan struct{}),
+	}
+	h.authenticateEndpoint(context.TODO(), resp, req)
 	if resp.Code != http.StatusOK {
 		t.Errorf("Expected status code %d, was %d", http.StatusOK, resp.Code)
 	}
@@ -617,10 +709,12 @@ func TestAuthenticateVerifierAccountMappingForUser(t *testing.T) {
 		"aws-iam-authenticator:0123456789012:Test",
 		nil,
 		map[string]authenticationv1beta1.ExtraValue{
-			"arn":          authenticationv1beta1.ExtraValue{"arn:aws:iam::0123456789012:user/Test"},
-			"canonicalArn": authenticationv1beta1.ExtraValue{"arn:aws:iam::0123456789012:user/Test"},
-			"sessionName":  authenticationv1beta1.ExtraValue{"TestSession"},
-			"accessKeyId":  authenticationv1beta1.ExtraValue{""},
+			"arn":          {"arn:aws:iam::0123456789012:user/Test"},
+			"canonicalArn": {"arn:aws:iam::0123456789012:user/Test"},
+			"sessionName":  {"TestSession"},
+			"accessKeyId":  {""},
+			"principalId":  {"Test"},
+			"sigs.k8s.io/aws-iam-authenticator/principalId": {"Test"},
 		}))
 	validateMetrics(t, validateOpts{success: 1})
 }
@@ -644,10 +738,13 @@ func TestAuthenticateVerifierAccountMappingForUserCRD(t *testing.T) {
 		UserID:       "Test",
 		SessionName:  "TestSession",
 	}})
-	h.mappers = []mapper.Mapper{crd.NewCRDMapperWithIndexer(createIndexer()), file.NewFileMapperWithMaps(nil, nil, map[string]bool{
-		"0123456789012": true,
-	})}
-	h.authenticateEndpoint(resp, req)
+	h.backendMapper = BackendMapper{
+		mappers: []mapper.Mapper{crd.NewCRDMapperWithIndexer(createIndexer()), file.NewFileMapperWithMaps(nil, nil, map[string]bool{
+			"0123456789012": true,
+		})},
+		mapperStopCh: make(chan struct{}),
+	}
+	h.authenticateEndpoint(context.TODO(), resp, req)
 	if resp.Code != http.StatusOK {
 		t.Errorf("Expected status code %d, was %d", http.StatusOK, resp.Code)
 	}
@@ -656,10 +753,12 @@ func TestAuthenticateVerifierAccountMappingForUserCRD(t *testing.T) {
 		"aws-iam-authenticator:0123456789012:Test",
 		nil,
 		map[string]authenticationv1beta1.ExtraValue{
-			"arn":          authenticationv1beta1.ExtraValue{"arn:aws:iam::0123456789012:user/Test"},
-			"canonicalArn": authenticationv1beta1.ExtraValue{"arn:aws:iam::0123456789012:user/Test"},
-			"sessionName":  authenticationv1beta1.ExtraValue{"TestSession"},
-			"accessKeyId":  authenticationv1beta1.ExtraValue{""},
+			"arn":          {"arn:aws:iam::0123456789012:user/Test"},
+			"canonicalArn": {"arn:aws:iam::0123456789012:user/Test"},
+			"sessionName":  {"TestSession"},
+			"accessKeyId":  {""},
+			"principalId":  {"Test"},
+			"sigs.k8s.io/aws-iam-authenticator/principalId": {"Test"},
 		}))
 	validateMetrics(t, validateOpts{success: 1})
 }
@@ -683,10 +782,13 @@ func TestAuthenticateVerifierAccountMappingForRole(t *testing.T) {
 		UserID:       "Test",
 		SessionName:  "TestSession",
 	}})
-	h.mappers = []mapper.Mapper{file.NewFileMapperWithMaps(nil, nil, map[string]bool{
-		"0123456789012": true,
-	})}
-	h.authenticateEndpoint(resp, req)
+	h.backendMapper = BackendMapper{
+		mappers: []mapper.Mapper{file.NewFileMapperWithMaps(nil, nil, map[string]bool{
+			"0123456789012": true,
+		})},
+		mapperStopCh: make(chan struct{}),
+	}
+	h.authenticateEndpoint(context.TODO(), resp, req)
 	if resp.Code != http.StatusOK {
 		t.Errorf("Expected status code %d, was %d", http.StatusOK, resp.Code)
 	}
@@ -695,10 +797,12 @@ func TestAuthenticateVerifierAccountMappingForRole(t *testing.T) {
 		"aws-iam-authenticator:0123456789012:Test",
 		nil,
 		map[string]authenticationv1beta1.ExtraValue{
-			"arn":          authenticationv1beta1.ExtraValue{"arn:aws:iam::0123456789012:assumed-role/Test/extra"},
-			"canonicalArn": authenticationv1beta1.ExtraValue{"arn:aws:iam::0123456789012:role/Test"},
-			"sessionName":  authenticationv1beta1.ExtraValue{"TestSession"},
-			"accessKeyId":  authenticationv1beta1.ExtraValue{""},
+			"arn":          {"arn:aws:iam::0123456789012:assumed-role/Test/extra"},
+			"canonicalArn": {"arn:aws:iam::0123456789012:role/Test"},
+			"sessionName":  {"TestSession"},
+			"accessKeyId":  {""},
+			"principalId":  {"Test"},
+			"sigs.k8s.io/aws-iam-authenticator/principalId": {"Test"},
 		}))
 	validateMetrics(t, validateOpts{success: 1})
 }
@@ -722,10 +826,13 @@ func TestAuthenticateVerifierAccountMappingForRoleCRD(t *testing.T) {
 		UserID:       "Test",
 		SessionName:  "TestSession",
 	}})
-	h.mappers = []mapper.Mapper{crd.NewCRDMapperWithIndexer(createIndexer()), file.NewFileMapperWithMaps(nil, nil, map[string]bool{
-		"0123456789012": true,
-	})}
-	h.authenticateEndpoint(resp, req)
+	h.backendMapper = BackendMapper{
+		mappers: []mapper.Mapper{crd.NewCRDMapperWithIndexer(createIndexer()), file.NewFileMapperWithMaps(nil, nil, map[string]bool{
+			"0123456789012": true,
+		})},
+		mapperStopCh: make(chan struct{}),
+	}
+	h.authenticateEndpoint(context.TODO(), resp, req)
 	if resp.Code != http.StatusOK {
 		t.Errorf("Expected status code %d, was %d", http.StatusOK, resp.Code)
 	}
@@ -734,10 +841,12 @@ func TestAuthenticateVerifierAccountMappingForRoleCRD(t *testing.T) {
 		"aws-iam-authenticator:0123456789012:Test",
 		nil,
 		map[string]authenticationv1beta1.ExtraValue{
-			"arn":          authenticationv1beta1.ExtraValue{"arn:aws:iam::0123456789012:assumed-role/Test/extra"},
-			"canonicalArn": authenticationv1beta1.ExtraValue{"arn:aws:iam::0123456789012:role/Test"},
-			"sessionName":  authenticationv1beta1.ExtraValue{"TestSession"},
-			"accessKeyId":  authenticationv1beta1.ExtraValue{""},
+			"arn":          {"arn:aws:iam::0123456789012:assumed-role/Test/extra"},
+			"canonicalArn": {"arn:aws:iam::0123456789012:role/Test"},
+			"sessionName":  {"TestSession"},
+			"accessKeyId":  {""},
+			"principalId":  {"Test"},
+			"sigs.k8s.io/aws-iam-authenticator/principalId": {"Test"},
 		}))
 	validateMetrics(t, validateOpts{success: 1})
 }
@@ -762,14 +871,17 @@ func TestAuthenticateVerifierNodeMapping(t *testing.T) {
 		SessionName:  "i-0c6f21bf1f24f9708",
 	}})
 	h.ec2Provider = newTestEC2Provider("ip-172-31-27-14", 15, 5)
-	h.mappers = []mapper.Mapper{file.NewFileMapperWithMaps(map[string]config.RoleMapping{
-		"arn:aws:iam::0123456789012:role/testnoderole": config.RoleMapping{
-			RoleARN:  "arn:aws:iam::0123456789012:role/TestNodeRole",
-			Username: "system:node:{{EC2PrivateDNSName}}",
-			Groups:   []string{"system:nodes", "system:bootstrappers"},
-		},
-	}, nil, nil)}
-	h.authenticateEndpoint(resp, req)
+	h.backendMapper = BackendMapper{
+		mappers: []mapper.Mapper{file.NewFileMapperWithMaps(map[string]config.RoleMapping{
+			"arn:aws:iam::0123456789012:role/testnoderole": {
+				RoleARN:  "arn:aws:iam::0123456789012:role/TestNodeRole",
+				Username: "system:node:{{EC2PrivateDNSName}}",
+				Groups:   []string{"system:nodes", "system:bootstrappers"},
+			},
+		}, nil, nil)},
+		mapperStopCh: make(chan struct{}),
+	}
+	h.authenticateEndpoint(context.TODO(), resp, req)
 	if resp.Code != http.StatusOK {
 		t.Errorf("Expected status code %d, was %d", http.StatusOK, resp.Code)
 	}
@@ -778,10 +890,12 @@ func TestAuthenticateVerifierNodeMapping(t *testing.T) {
 		"aws-iam-authenticator:0123456789012:TestNodeRole",
 		[]string{"system:nodes", "system:bootstrappers"},
 		map[string]authenticationv1beta1.ExtraValue{
-			"arn":          authenticationv1beta1.ExtraValue{"arn:aws:iam::0123456789012:role/TestNodeRole"},
-			"canonicalArn": authenticationv1beta1.ExtraValue{"arn:aws:iam::0123456789012:role/TestNodeRole"},
-			"sessionName":  authenticationv1beta1.ExtraValue{"i-0c6f21bf1f24f9708"},
-			"accessKeyId":  authenticationv1beta1.ExtraValue{""},
+			"arn":          {"arn:aws:iam::0123456789012:role/TestNodeRole"},
+			"canonicalArn": {"arn:aws:iam::0123456789012:role/TestNodeRole"},
+			"sessionName":  {"i-0c6f21bf1f24f9708"},
+			"accessKeyId":  {""},
+			"principalId":  {"TestNodeRole"},
+			"sigs.k8s.io/aws-iam-authenticator/principalId": {"TestNodeRole"},
 		}))
 	validateMetrics(t, validateOpts{success: 1})
 
@@ -808,9 +922,14 @@ func TestAuthenticateVerifierNodeMappingCRD(t *testing.T) {
 	}})
 	h.ec2Provider = newTestEC2Provider("ip-172-31-27-14", 15, 5)
 	indexer := createIndexer()
-	indexer.Add(newIAMIdentityMapping("arn:aws:iam::0123456789012:role/TestNodeRole", "arn:aws:iam::0123456789012:role/testnoderole", "system:node:{{EC2PrivateDNSName}}", []string{"system:nodes", "system:bootstrappers"}))
-	h.mappers = []mapper.Mapper{crd.NewCRDMapperWithIndexer(indexer)}
-	h.authenticateEndpoint(resp, req)
+	if err := indexer.Add(newIAMIdentityMapping("arn:aws:iam::0123456789012:role/TestNodeRole", "arn:aws:iam::0123456789012:role/testnoderole", "system:node:{{EC2PrivateDNSName}}", []string{"system:nodes", "system:bootstrappers"})); err != nil {
+		t.Fatalf("Could not add IAM identity mapping: %v", err)
+	}
+	h.backendMapper = BackendMapper{
+		mappers:      []mapper.Mapper{crd.NewCRDMapperWithIndexer(indexer)},
+		mapperStopCh: make(chan struct{}),
+	}
+	h.authenticateEndpoint(context.TODO(), resp, req)
 	if resp.Code != http.StatusOK {
 		t.Errorf("Expected status code %d, was %d", http.StatusOK, resp.Code)
 	}
@@ -819,10 +938,12 @@ func TestAuthenticateVerifierNodeMappingCRD(t *testing.T) {
 		"aws-iam-authenticator:0123456789012:TestNodeRole",
 		[]string{"system:nodes", "system:bootstrappers"},
 		map[string]authenticationv1beta1.ExtraValue{
-			"arn":          authenticationv1beta1.ExtraValue{"arn:aws:iam::0123456789012:role/TestNodeRole"},
-			"canonicalArn": authenticationv1beta1.ExtraValue{"arn:aws:iam::0123456789012:role/TestNodeRole"},
-			"sessionName":  authenticationv1beta1.ExtraValue{"i-0c6f21bf1f24f9708"},
-			"accessKeyId":  authenticationv1beta1.ExtraValue{""},
+			"arn":          {"arn:aws:iam::0123456789012:role/TestNodeRole"},
+			"canonicalArn": {"arn:aws:iam::0123456789012:role/TestNodeRole"},
+			"sessionName":  {"i-0c6f21bf1f24f9708"},
+			"accessKeyId":  {""},
+			"principalId":  {"TestNodeRole"},
+			"sigs.k8s.io/aws-iam-authenticator/principalId": {"TestNodeRole"},
 		}))
 	validateMetrics(t, validateOpts{success: 1})
 
@@ -837,13 +958,6 @@ func TestRenderTemplate(t *testing.T) {
 		identity token.Identity
 		err      bool
 	}{
-		{
-			template: "a-{{EC2PrivateDNSName}}-b",
-			want:     "a-ip-172-31-27-14-b",
-			identity: token.Identity{
-				SessionName: "i-aaaaaaaa",
-			},
-		},
 		{
 			template: "a-{{EC2PrivateDNSName}}-b",
 			want:     "a-ip-172-31-27-14-b",
@@ -898,7 +1012,7 @@ func TestRenderTemplate(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.template, func(t *testing.T) {
-			got, err := h.renderTemplate(c.template, &c.identity)
+			got, err := h.renderTemplate(context.TODO(), c.template, &c.identity)
 			if err != nil {
 				if c.err {
 					return
@@ -912,5 +1026,29 @@ func TestRenderTemplate(t *testing.T) {
 			}
 
 		})
+	}
+}
+
+func TestCallBackForFileLoad(t *testing.T) {
+	fileContent := strings.Split(string("DynamicFile,MountedFile"), ",")
+
+	cfg := config.Config{
+		DynamicFilePath: "/tmp/server_test.txt",
+	}
+	h := &handler{
+		cfg: cfg,
+	}
+	newMapper, err := BuildMapperChain(h.cfg, fileContent)
+	if err != nil {
+		t.Errorf("Fail in TestCallBackForFileLoad: BuildMapperChain")
+	}
+	if len(newMapper.mappers) != len(fileContent) {
+		t.Errorf("Fail in TestCallBackForFileLoad: unpected mapper length")
+	}
+	if newMapper.mappers[0].Name() != "DynamicFile" {
+		t.Errorf("Fail in TestCallBackForFileLoad: unpected mapper mode")
+	}
+	if newMapper.mappers[1].Name() != "MountedFile" {
+		t.Errorf("Fail in TestCallBackForFileLoad: unpected mapper mode")
 	}
 }

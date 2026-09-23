@@ -5,14 +5,17 @@ import (
 	"testing"
 	"time"
 
-	core_v1 "k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/watch"
 
-	v1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	corev1 "k8s.io/client-go/applyconfigurations/core/v1"
+	gentype "k8s.io/client-go/gentype"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/kubernetes/typed/core/v1/fake"
 	k8stesting "k8s.io/client-go/testing"
 	"sigs.k8s.io/aws-iam-authenticator/pkg/config"
+	"sigs.k8s.io/aws-iam-authenticator/pkg/mapper"
 )
 
 func init() {
@@ -32,8 +35,8 @@ var (
 	}
 )
 
-func makeStore() MapStore {
-	ms := MapStore{
+func makeStore() *MapStore {
+	ms := &MapStore{
 		users:       make(map[string]config.UserMapping),
 		roles:       make(map[string]config.RoleMapping),
 		awsAccounts: make(map[string]interface{}),
@@ -45,14 +48,14 @@ func makeStore() MapStore {
 	return ms
 }
 
-func makeStoreWClient() (MapStore, *fake.FakeConfigMaps) {
-	fakeConfigMaps := &fake.FakeConfigMaps{}
-	fakeConfigMaps.Fake = &fake.FakeCoreV1{}
-	fakeConfigMaps.Fake.Fake = &k8stesting.Fake{}
-	ms := MapStore{
+func makeStoreWClient() (*MapStore, *fakeConfigMaps) {
+	fakeCore := &fake.FakeCoreV1{}
+	fakeCore.Fake = &k8stesting.Fake{}
+	fakeConfigMaps := newFakeConfigMaps(fakeCore, "")
+	ms := &MapStore{
 		users:     make(map[string]config.UserMapping),
 		roles:     make(map[string]config.RoleMapping),
-		configMap: v1.ConfigMapInterface(fakeConfigMaps),
+		configMap: typedcorev1.ConfigMapInterface(fakeConfigMaps),
 	}
 	return ms, fakeConfigMaps
 }
@@ -68,8 +71,8 @@ func TestUserMapping(t *testing.T) {
 	}
 
 	user, err = ms.UserMapping("nic")
-	if err != UserNotFound {
-		t.Errorf("UserNotFound error was not returned for user 'nic'")
+	if err != ErrUserNotFound {
+		t.Errorf("ErrUserNotFound error was not returned for user 'nic'")
 	}
 	if !reflect.DeepEqual(user, config.UserMapping{}) {
 		t.Errorf("User value returned when user is not in the map was not empty: %+v", user)
@@ -87,11 +90,11 @@ func TestRoleMapping(t *testing.T) {
 	}
 
 	role, err = ms.RoleMapping("borg")
-	if err != RoleNotFound {
-		t.Errorf("RoleNotFound error was not returend for role 'borg'")
+	if err != ErrRoleNotFound {
+		t.Errorf("ErrRoleNotFound error was not returend for role 'borg'")
 	}
 	if !reflect.DeepEqual(role, config.RoleMapping{}) {
-		t.Errorf("Role value returend when role is not in map was not empty: %+v", role)
+		t.Errorf("Role value returned when role is not in map was not empty: %+v", role)
 	}
 }
 
@@ -177,8 +180,8 @@ func TestLoadConfigMap(t *testing.T) {
 
 	watcher := watch.NewFake()
 
-	fakeConfigMaps.Fake.Fake.AddWatchReactor("configmaps",
-		func(action k8stesting.Action) (handled bool, ret watch.Interface, err error) {
+	fakeConfigMaps.Fake.AddWatchReactor("configmaps",
+		func(_ k8stesting.Action) (handled bool, ret watch.Interface, err error) {
 			return true, watcher, nil
 		})
 
@@ -194,7 +197,7 @@ func TestLoadConfigMap(t *testing.T) {
 	data["mapRoles"] = roleMapping
 	data["mapAccounts"] = autoMappedAWSAccountsYAML
 
-	watcher.Add(&core_v1.ConfigMap{ObjectMeta: meta, Data: data})
+	watcher.Add(&v1.ConfigMap{ObjectMeta: meta, Data: data})
 
 	time.Sleep(2 * time.Second)
 
@@ -224,7 +227,7 @@ func TestLoadConfigMap(t *testing.T) {
 	updateData["mapUsers"] = updatedUserMapping
 	updateData["mapRoles"] = updatedRoleMapping
 	updateData["mapAccounts"] = updatedAWSAccountsYAML
-	watcher.Modify(&core_v1.ConfigMap{ObjectMeta: meta, Data: updateData})
+	watcher.Modify(&v1.ConfigMap{ObjectMeta: meta, Data: updateData})
 
 	//TODO: Sync without using sleep
 	time.Sleep(10 * time.Millisecond)
@@ -238,7 +241,7 @@ func TestLoadConfigMap(t *testing.T) {
 	}
 
 	expectedUser.Groups = append(expectedUser.Groups, "test")
-	user, err = ms.UserMapping("arn:aws:iam::012345678912:user/NIC")
+	user, _ = ms.UserMapping("arn:aws:iam::012345678912:user/NIC")
 	if !reflect.DeepEqual(user, expectedUser) {
 		t.Errorf("Updated returned from mapping does not match expected user. (Actual: %+v, Expected: %+v", user, expectedUser)
 	}
@@ -250,15 +253,14 @@ func TestLoadConfigMap(t *testing.T) {
 	}
 
 	user, err = ms.UserMapping("arn:iam:beswar")
-	if !reflect.DeepEqual(user, expectedUser) {
+	if err != nil || !reflect.DeepEqual(user, expectedUser) {
 		t.Errorf("Updated did not return new user 'arn:iam:beswar', matching expected value. (Actual: %+v, Expected: %+v", user, expectedUser)
 	}
 
-	user, err = ms.UserMapping("arn:iam:matlan")
-	if err != UserNotFound {
+	_, err = ms.UserMapping("arn:iam:matlan")
+	if err != ErrUserNotFound {
 		t.Errorf("Expected updated mapping not to contain user 'arn:iam:matlan', got err: %v", err)
 	}
-
 }
 
 func TestParseMap(t *testing.T) {
@@ -329,5 +331,98 @@ func TestParseMap(t *testing.T) {
 	}
 	if !reflect.DeepEqual(m1, m2) {
 		t.Fatalf("unexpected %v != %v", m1, m2)
+	}
+}
+
+func TestBadParseMap(t *testing.T) {
+	m1 := map[string]string{
+		"mapAccounts": ``,
+		"mapRoles":    `""`,
+		"mapUsers":    "``",
+	}
+
+	u, r, a, err := ParseMap(m1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m2, err := EncodeMap(u, r, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyMap := map[string]string{}
+	if !reflect.DeepEqual(emptyMap, m2) {
+		t.Fatalf("unexpected %v != %v", emptyMap, m2)
+	}
+}
+
+func TestBadParseMapSingleQuote(t *testing.T) {
+	m1 := map[string]string{
+		"mapAccounts": `''`,
+		"mapRoles":    `''`,
+		"mapUsers":    `''`,
+	}
+
+	u, r, a, err := ParseMap(m1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m2, err := EncodeMap(u, r, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyMap := map[string]string{}
+	if !reflect.DeepEqual(emptyMap, m2) {
+		t.Fatalf("unexpected %v != %v", emptyMap, m2)
+	}
+}
+
+func TestConfigMapMapperReservedPrefixesFromConfig(t *testing.T) {
+	cfg := config.Config{
+		ReservedPrefixConfig: map[string]config.ReservedPrefixConfig{
+			mapper.ModeEKSConfigMap: {
+				BackendMode:               mapper.ModeEKSConfigMap,
+				UsernamePrefixReserveList: []string{"system:", "eks:"},
+			},
+		},
+	}
+	m := &ConfigMapMapper{}
+	if value, exists := cfg.ReservedPrefixConfig[mapper.ModeEKSConfigMap]; exists {
+		m.usernamePrefixReserveList = value.UsernamePrefixReserveList
+	}
+	got := m.UsernamePrefixReserveList()
+	want := []string{"system:", "eks:"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("UsernamePrefixReserveList() = %v, want %v", got, want)
+	}
+}
+
+func TestConfigMapMapperReservedPrefixesEmptyByDefault(t *testing.T) {
+	m := &ConfigMapMapper{}
+	if got := m.UsernamePrefixReserveList(); len(got) != 0 {
+		t.Errorf("UsernamePrefixReserveList() = %v, want empty, got %v", got, got)
+	}
+}
+
+type fakeConfigMaps struct {
+	*gentype.FakeClientWithListAndApply[*v1.ConfigMap, *v1.ConfigMapList, *corev1.ConfigMapApplyConfiguration]
+	Fake *fake.FakeCoreV1
+}
+
+func newFakeConfigMaps(fake *fake.FakeCoreV1, namespace string) *fakeConfigMaps {
+	return &fakeConfigMaps{
+		gentype.NewFakeClientWithListAndApply[*v1.ConfigMap, *v1.ConfigMapList, *corev1.ConfigMapApplyConfiguration](
+			fake.Fake,
+			namespace,
+			v1.SchemeGroupVersion.WithResource("configmaps"),
+			v1.SchemeGroupVersion.WithKind("ConfigMap"),
+			func() *v1.ConfigMap { return &v1.ConfigMap{} },
+			func() *v1.ConfigMapList { return &v1.ConfigMapList{} },
+			func(dst, src *v1.ConfigMapList) { dst.ListMeta = src.ListMeta },
+			func(list *v1.ConfigMapList) []*v1.ConfigMap { return gentype.ToPointerSlice(list.Items) },
+			func(list *v1.ConfigMapList, items []*v1.ConfigMap) { list.Items = gentype.FromPointerSlice(items) },
+		),
+		fake,
 	}
 }

@@ -1,3 +1,4 @@
+// Package configmap implements IAM identity mapping using the aws-auth Kubernetes ConfigMap.
 package configmap
 
 import (
@@ -5,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,6 +25,7 @@ import (
 	"sigs.k8s.io/aws-iam-authenticator/pkg/metrics"
 )
 
+// MapStore holds the in-memory representation of the aws-auth ConfigMap.
 type MapStore struct {
 	mutex sync.RWMutex
 	users map[string]config.UserMapping
@@ -32,11 +35,14 @@ type MapStore struct {
 	configMap   v1.ConfigMapInterface
 }
 
+// New creates a MapStore connected to the Kubernetes API at the given master URL and kubeconfig.
 func New(masterURL, kubeConfig string) (*MapStore, error) {
 	clientconfig, err := clientcmd.BuildConfigFromFlags(masterURL, kubeConfig)
 	if err != nil {
 		return nil, err
 	}
+	clientconfig.AcceptContentTypes = "application/vnd.kubernetes.protobuf,application/json"
+	clientconfig.ContentType = "application/vnd.kubernetes.protobuf"
 	clientset, err := kubernetes.NewForConfig(clientconfig)
 	if err != nil {
 		return nil, err
@@ -51,9 +57,11 @@ func New(masterURL, kubeConfig string) (*MapStore, error) {
 // when the values change.
 func (ms *MapStore) startLoadConfigMap(stopCh <-chan struct{}) {
 	go func() {
+		logrus.Info("startLoadConfigMap in EKSConfigMap")
 		for {
 			select {
 			case <-stopCh:
+				logrus.Info("stopCh is closed in startLoadConfigMap")
 				return
 			default:
 				watcher, err := ms.configMap.Watch(context.TODO(), metav1.ListOptions{
@@ -70,7 +78,7 @@ func (ms *MapStore) startLoadConfigMap(stopCh <-chan struct{}) {
 				for r := range watcher.ResultChan() {
 					switch r.Type {
 					case watch.Error:
-						logrus.WithFields(logrus.Fields{"error": r}).Error("recieved a watch error")
+						logrus.WithFields(logrus.Fields{"error": r}).Error("received a watch error")
 					case watch.Deleted:
 						logrus.Info("Resetting configmap on delete")
 						userMappings := make([]config.UserMapping, 0)
@@ -96,12 +104,13 @@ func (ms *MapStore) startLoadConfigMap(stopCh <-chan struct{}) {
 
 					}
 				}
-				logrus.Error("Watch channel closed.")
+				logrus.Warn("Watch channel closed. Reconnecting...")
 			}
 		}
 	}()
 }
 
+// ErrParsingMap is returned when one or more errors occur parsing the aws-auth ConfigMap data.
 type ErrParsingMap struct {
 	errors []error
 }
@@ -110,26 +119,29 @@ func (err ErrParsingMap) Error() string {
 	return fmt.Sprintf("error parsing config map: %v", err.errors)
 }
 
+// ParseMap parses the aws-auth ConfigMap data into user mappings, role mappings, and AWS account IDs.
 func ParseMap(m map[string]string) (userMappings []config.UserMapping, roleMappings []config.RoleMapping, awsAccounts []string, err error) {
 	errs := make([]error, 0)
 	rawUserMappings := make([]config.UserMapping, 0)
 	userMappings = make([]config.UserMapping, 0)
 	if userData, ok := m["mapUsers"]; ok {
-		userJson, err := utilyaml.ToJSON([]byte(userData))
-		if err != nil {
-			errs = append(errs, err)
-		} else {
-			err = json.Unmarshal(userJson, &rawUserMappings)
+		if !isSkippable(userData) {
+			userJSON, err := utilyaml.ToJSON([]byte(userData))
 			if err != nil {
 				errs = append(errs, err)
-			}
-
-			for _, userMapping := range rawUserMappings {
-				err = userMapping.Validate()
+			} else {
+				err = json.Unmarshal(userJSON, &rawUserMappings)
 				if err != nil {
 					errs = append(errs, err)
-				} else {
-					userMappings = append(userMappings, userMapping)
+				}
+
+				for _, userMapping := range rawUserMappings {
+					err = userMapping.Validate()
+					if err != nil {
+						errs = append(errs, err)
+					} else {
+						userMappings = append(userMappings, userMapping)
+					}
 				}
 			}
 		}
@@ -138,21 +150,23 @@ func ParseMap(m map[string]string) (userMappings []config.UserMapping, roleMappi
 	rawRoleMappings := make([]config.RoleMapping, 0)
 	roleMappings = make([]config.RoleMapping, 0)
 	if roleData, ok := m["mapRoles"]; ok {
-		roleJson, err := utilyaml.ToJSON([]byte(roleData))
-		if err != nil {
-			errs = append(errs, err)
-		} else {
-			err = json.Unmarshal(roleJson, &rawRoleMappings)
+		if !isSkippable(roleData) {
+			roleJSON, err := utilyaml.ToJSON([]byte(roleData))
 			if err != nil {
 				errs = append(errs, err)
-			}
-
-			for _, roleMapping := range rawRoleMappings {
-				err = roleMapping.Validate()
+			} else {
+				err = json.Unmarshal(roleJSON, &rawRoleMappings)
 				if err != nil {
 					errs = append(errs, err)
-				} else {
-					roleMappings = append(roleMappings, roleMapping)
+				}
+
+				for _, roleMapping := range rawRoleMappings {
+					err = roleMapping.Validate()
+					if err != nil {
+						errs = append(errs, err)
+					} else {
+						roleMappings = append(roleMappings, roleMapping)
+					}
 				}
 			}
 		}
@@ -160,9 +174,11 @@ func ParseMap(m map[string]string) (userMappings []config.UserMapping, roleMappi
 
 	awsAccounts = make([]string, 0)
 	if accountsData, ok := m["mapAccounts"]; ok {
-		err := yaml.Unmarshal([]byte(accountsData), &awsAccounts)
-		if err != nil {
-			errs = append(errs, err)
+		if !isSkippable(accountsData) {
+			err := yaml.Unmarshal([]byte(accountsData), &awsAccounts)
+			if err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 
@@ -173,6 +189,12 @@ func ParseMap(m map[string]string) (userMappings []config.UserMapping, roleMappi
 	return userMappings, roleMappings, awsAccounts, err
 }
 
+func isSkippable(data string) bool {
+	trimmed := strings.TrimSpace(data)
+	return trimmed == "" || trimmed == "``" || trimmed == "\"\"" || trimmed == "''"
+}
+
+// EncodeMap encodes user mappings, role mappings, and AWS accounts into ConfigMap data format.
 func EncodeMap(userMappings []config.UserMapping, roleMappings []config.RoleMapping, awsAccounts []string) (m map[string]string, err error) {
 	m = make(map[string]string)
 
@@ -225,12 +247,13 @@ func (ms *MapStore) saveMap(
 	}
 }
 
-// UserNotFound is the error returned when the user is not found in the config map.
-var UserNotFound = errors.New("User not found in configmap")
+// ErrUserNotFound is the error returned when the user is not found in the config map.
+var ErrUserNotFound = errors.New("user not found in configmap")
 
-// RoleNotFound is the error returned when the role is not found in the config map.
-var RoleNotFound = errors.New("Role not found in configmap")
+// ErrRoleNotFound is the error returned when the role is not found in the config map.
+var ErrRoleNotFound = errors.New("role not found in configmap")
 
+// UserMapping returns the UserMapping for the given ARN, or ErrUserNotFound.
 func (ms *MapStore) UserMapping(arn string) (config.UserMapping, error) {
 	ms.mutex.RLock()
 	defer ms.mutex.RUnlock()
@@ -239,9 +262,10 @@ func (ms *MapStore) UserMapping(arn string) (config.UserMapping, error) {
 			return user, nil
 		}
 	}
-	return config.UserMapping{}, UserNotFound
+	return config.UserMapping{}, ErrUserNotFound
 }
 
+// RoleMapping returns the RoleMapping for the given ARN, or ErrRoleNotFound.
 func (ms *MapStore) RoleMapping(arn string) (config.RoleMapping, error) {
 	ms.mutex.RLock()
 	defer ms.mutex.RUnlock()
@@ -250,9 +274,10 @@ func (ms *MapStore) RoleMapping(arn string) (config.RoleMapping, error) {
 			return role, nil
 		}
 	}
-	return config.RoleMapping{}, RoleNotFound
+	return config.RoleMapping{}, ErrRoleNotFound
 }
 
+// AWSAccount returns true if the given account ID is in the allowed accounts set.
 func (ms *MapStore) AWSAccount(id string) bool {
 	ms.mutex.RLock()
 	defer ms.mutex.RUnlock()

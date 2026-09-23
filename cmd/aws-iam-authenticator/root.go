@@ -14,22 +14,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Package main is the entry point for the aws-iam-authenticator CLI.
 package main
 
 import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
+	"strings"
 
 	"sigs.k8s.io/aws-iam-authenticator/pkg/config"
 	"sigs.k8s.io/aws-iam-authenticator/pkg/mapper"
 
-	"github.com/aws/aws-sdk-go/aws/endpoints"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/component-base/featuregate"
+	"sigs.k8s.io/aws-iam-authenticator/pkg/endpoints"
 )
 
 var cfgFile string
@@ -59,22 +62,55 @@ func init() {
 
 	rootCmd.PersistentFlags().StringP("log-format", "l", "text", "Specify log format to use when logging to stderr [text or json]")
 
+	rootCmd.PersistentFlags().StringP("log-verbosity", "v", "info",
+		"Specify log level to use when logging to stderr ["+strings.Join(getValidLogLevels(), ", ")+"]")
+	if err := viper.BindPFlag("log-verbosity", rootCmd.PersistentFlags().Lookup("log-verbosity")); err != nil {
+		fmt.Printf("Failed to bind flag '%s' - %+v\n", "log-verbosity", err)
+		os.Exit(1)
+	}
+
+	if err := viper.BindEnv("log-verbosity", "AWS_IAM_AUTHENTICATOR_LOG_VERBOSITY"); err != nil {
+		fmt.Printf("Failed to bind env '%s' - %+v\n", "log-verbosity", err)
+		os.Exit(1)
+	}
+
 	rootCmd.PersistentFlags().StringP(
 		"cluster-id",
 		"i",
 		"",
 		"Specify the cluster `ID`, a unique-per-cluster identifier for your aws-iam-authenticator installation.")
-	viper.BindPFlag("clusterID", rootCmd.PersistentFlags().Lookup("cluster-id"))
-	viper.BindEnv("clusterID", "KUBERNETES_AWS_AUTHENTICATOR_CLUSTER_ID")
+	if err := viper.BindPFlag("clusterID", rootCmd.PersistentFlags().Lookup("cluster-id")); err != nil {
+		fmt.Printf("Failed to bind flag '%s' - %+v\n", "clusterID", err)
+		os.Exit(1)
+	}
+	if err := viper.BindEnv("clusterID", "KUBERNETES_AWS_AUTHENTICATOR_CLUSTER_ID"); err != nil {
+		fmt.Printf("Failed to bind env '%s' - %+v\n", "clusterID", err)
+		os.Exit(1)
+	}
 
-	featureGates.Add(config.DefaultFeatureGates)
+	if err := featureGates.Add(config.DefaultFeatureGates); err != nil {
+		fmt.Printf("Failed to add feature gates - %+v\n", err)
+		os.Exit(1)
+	}
 	featureGates.AddFlag(rootCmd.PersistentFlags())
 
-	viper.BindPFlag("feature-gates", rootCmd.PersistentFlags().Lookup("feature-gates"))
+	if err := viper.BindPFlag("feature-gates", rootCmd.PersistentFlags().Lookup("feature-gates")); err != nil {
+		fmt.Printf("Failed to bind flag '%s' - %+v\n", "feature-gates", err)
+		os.Exit(1)
+	}
 }
 
 func initConfig() {
 	logrus.SetFormatter(getLogFormatter())
+
+	logLevel := viper.GetString("log-verbosity")
+	if level, err := logrus.ParseLevel(logLevel); err == nil {
+		logrus.SetLevel(level)
+	} else {
+		fmt.Printf("Invalid log level %q. Valid values are: %s\n", logLevel, strings.Join(getValidLogLevels(), ", "))
+		os.Exit(1)
+	}
+
 	if cfgFile == "" {
 		return
 	}
@@ -86,11 +122,11 @@ func initConfig() {
 }
 
 func getConfig() (config.Config, error) {
-
 	cfg := config.Config{
 		PartitionID:                       viper.GetString("server.partition"),
 		ClusterID:                         viper.GetString("clusterID"),
 		ServerEC2DescribeInstancesRoleARN: viper.GetString("server.ec2DescribeInstancesRoleARN"),
+		SourceARN:                         viper.GetString("server.sourceARN"),
 		HostPort:                          viper.GetInt("server.port"),
 		Hostname:                          viper.GetString("server.hostname"),
 		GenerateKubeconfigPath:            viper.GetString("server.generateKubeconfig"),
@@ -103,7 +139,13 @@ func getConfig() (config.Config, error) {
 		EC2DescribeInstancesQps:           viper.GetInt("server.ec2DescribeInstancesQps"),
 		EC2DescribeInstancesBurst:         viper.GetInt("server.ec2DescribeInstancesBurst"),
 		ScrubbedAWSAccounts:               viper.GetStringSlice("server.scrubbedAccounts"),
-		DynamicFilePath:                   viper.GetString("server.dynamicfilepath"),
+		// flags for dynamicfile mode
+		// DynamicFilePath: the file path containing the roleMapping and userMapping
+		DynamicFilePath: viper.GetString("server.dynamicfilepath"),
+		// DynamicFileUserIDStrict: if true, then aws UserId from sts will be used to look up the roleMapping/userMapping; or aws IdentityArn is used
+		DynamicFileUserIDStrict: viper.GetBool("server.dynamicfileUserIDStrict"),
+		// DynamicBackendModePath: the file path containing the backend mode
+		DynamicBackendModePath: viper.GetString("server.dynamicBackendModePath"),
 	}
 	if err := viper.UnmarshalKey("server.mapRoles", &cfg.RoleMappings); err != nil {
 		return cfg, fmt.Errorf("invalid server role mappings: %v", err)
@@ -114,7 +156,16 @@ func getConfig() (config.Config, error) {
 	if err := viper.UnmarshalKey("server.mapAccounts", &cfg.AutoMappedAWSAccounts); err != nil {
 		logrus.WithError(err).Fatal("invalid server account mappings")
 	}
-
+	var reservedPrefixConfig []config.ReservedPrefixConfig
+	if err := viper.UnmarshalKey("server.reservedPrefixConfig", &reservedPrefixConfig); err != nil {
+		return cfg, fmt.Errorf("invalid reserved prefix config: %v", err)
+	}
+	if len(reservedPrefixConfig) > 0 {
+		cfg.ReservedPrefixConfig = make(map[string]config.ReservedPrefixConfig)
+		for _, c := range reservedPrefixConfig {
+			cfg.ReservedPrefixConfig[c.BackendMode] = c
+		}
+	}
 	if featureGates.Enabled(config.SSORoleMatch) {
 		logrus.Info("SSORoleMatch feature enabled")
 		config.SSORoleMatchEnabled = true
@@ -127,14 +178,8 @@ func getConfig() (config.Config, error) {
 		return cfg, errors.New("cluster ID cannot be empty")
 	}
 
-	partitionKeys := []string{}
-	partitionMap := map[string]endpoints.Partition{}
-	for _, p := range endpoints.DefaultPartitions() {
-		partitionMap[p.ID()] = p
-		partitionKeys = append(partitionKeys, p.ID())
-	}
-	if _, ok := partitionMap[cfg.PartitionID]; !ok {
-		return cfg, errors.New("Invalid partition")
+	if !slices.Contains(endpoints.PARTITIONS, cfg.PartitionID) {
+		return cfg, errors.New("invalid partition")
 	}
 
 	// DynamicFile BackendMode and DynamicFilePath are mutually inclusive.
@@ -168,4 +213,12 @@ func getLogFormatter() logrus.Formatter {
 	}
 
 	return &logrus.TextFormatter{FullTimestamp: true}
+}
+
+func getValidLogLevels() []string {
+	var levels []string
+	for _, level := range logrus.AllLevels {
+		levels = append(levels, level.String())
+	}
+	return levels
 }

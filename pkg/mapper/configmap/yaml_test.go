@@ -2,7 +2,7 @@ package configmap
 
 import (
 	"context"
-	"io/ioutil"
+	"os"
 	"path"
 	"reflect"
 	"strings"
@@ -104,7 +104,7 @@ func TestConfigMap(t *testing.T) {
 				t.Errorf("expected error creating configMap from yaml, got nothing")
 			}
 
-			cs := fake.NewSimpleClientset()
+			cs := fake.NewClientset()
 			ms := MapStore{}
 			ms.configMap = cs.CoreV1().ConfigMaps("kube-system")
 
@@ -163,7 +163,7 @@ func TestConfigMap(t *testing.T) {
 
 func configMapFromYaml(fileName string) (*v1.ConfigMap, error) {
 	var cm v1.ConfigMap
-	data, err := ioutil.ReadFile(path.Join("./yaml/", fileName))
+	data, err := os.ReadFile(path.Join("./yaml/", fileName)) //nolint:gosec // G304: test helper reads fixture files from a fixed relative path
 	if err != nil {
 		return nil, err
 	}

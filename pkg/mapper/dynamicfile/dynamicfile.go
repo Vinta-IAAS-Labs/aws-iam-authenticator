@@ -1,35 +1,43 @@
+// Package dynamicfile implements IAM identity mapping using a dynamically reloaded file.
 package dynamicfile
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
-	"time"
 
-	"github.com/fsnotify/fsnotify"
 	"github.com/sirupsen/logrus"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/aws-iam-authenticator/pkg/arn"
 	"sigs.k8s.io/aws-iam-authenticator/pkg/config"
+	"sigs.k8s.io/aws-iam-authenticator/pkg/errutil"
+	"sigs.k8s.io/aws-iam-authenticator/pkg/fileutil"
+	"sigs.k8s.io/aws-iam-authenticator/pkg/metrics"
 )
 
-type DynamicFileMapStore struct {
+// DynamicFileMapStore holds in-memory IAM mappings loaded from a dynamic file.
+type DynamicFileMapStore struct { //nolint:revive // exported: stutter preserved for backwards compatibility
 	mutex sync.RWMutex
 	users map[string]config.UserMapping
 	roles map[string]config.RoleMapping
 	// Used as set.
-	awsAccounts map[string]interface{}
-	filename    string
+	awsAccounts               map[string]interface{}
+	filename                  string
+	userIDStrict              bool
+	usernamePrefixReserveList []string
+
+	dynamicFileInitDone bool
 }
 
-type DynamicFileData struct {
+// DynamicFileData represents the parsed content of the dynamic IAM mapping file.
+type DynamicFileData struct { //nolint:revive // exported: stutter preserved for backwards compatibility
+	// Time that the object takes from update time to load time
+	LastUpdatedDateTime string `json:"LastUpdatedDateTime"`
+	// Version is the version number of the update
+	Version string `json:"Version"`
 	// RoleMappings is a list of mappings from AWS IAM Role to
 	// Kubernetes username + groups.
 	RoleMappings []config.RoleMapping `json:"mapRoles"`
-
 	// UserMappings is a list of mappings from AWS IAM User to
 	// Kubernetes username + groups.
 	UserMappings []config.UserMapping `json:"mapUsers"`
@@ -38,6 +46,7 @@ type DynamicFileData struct {
 	AutoMappedAWSAccounts []string `json:"mapAccounts"`
 }
 
+// ErrParsingMap is returned when one or more errors occur parsing the dynamic mapping file.
 type ErrParsingMap struct {
 	errors []error
 }
@@ -46,132 +55,15 @@ func (err ErrParsingMap) Error() string {
 	return fmt.Sprintf("error parsing dynamic file: %v", err.errors)
 }
 
-func waitUntilFileAvailable(filename string) error {
-	for {
-		_, err := os.Stat(filename)
-		if os.IsNotExist(err) {
-			time.Sleep(1 * time.Second)
-			continue
-		} else {
-			return err
-		}
-	}
-}
-
-func (m *DynamicFileMapStore) loadDynamicFile() error {
-	err := waitUntilFileAvailable(m.filename)
-	if err != nil {
-		logrus.Errorf("LoadDynamicFile: failed to wait till dynamic file available %v", err)
-		return err
-	}
-	logrus.Infof("LoadDynamicFile: %v is available. loading", m.filename)
-	// load the initial file content into memory
-	userMappings, roleMappings, awsAccounts, err := ParseMap(m.filename)
-	if err != nil {
-		logrus.Errorf("LoadDynamicFile: There was an error parsing the dynamic file: %+v. Map is not updated. Please correct dynamic file", err)
-		return err
-	} else {
-		m.saveMap(userMappings, roleMappings, awsAccounts)
-	}
-	return nil
-}
-
-func NewDynamicFileMapStore(filename string) (*DynamicFileMapStore, error) {
+// NewDynamicFileMapStore creates a new DynamicFileMapStore configured from the given Config.
+func NewDynamicFileMapStore(cfg config.Config) (*DynamicFileMapStore, error) {
 	ms := DynamicFileMapStore{}
-	ms.filename = filename
+	ms.filename = cfg.DynamicFilePath
+	ms.userIDStrict = cfg.DynamicFileUserIDStrict
+	ms.dynamicFileInitDone = false
 	return &ms, nil
 }
 
-func (m *DynamicFileMapStore) startLoadDynamicFile(stopCh <-chan struct{}) {
-	go wait.Until(func() {
-		m.loadDynamicFile()
-		// start to watch the file change
-		watcher, err := fsnotify.NewWatcher()
-		if err != nil {
-			logrus.Errorf("startLoadDynamicFile: failed when call fsnotify.NewWatcher, %+v", err)
-		}
-		err = watcher.Add(m.filename)
-		if err != nil {
-			logrus.Errorf("startLoadDynamicFile: could not add file to watcher %v", err)
-		}
-
-		defer watcher.Close()
-		for {
-			select {
-			case <-stopCh:
-				return
-			case event := <-watcher.Events:
-				switch {
-				case event.Op&fsnotify.Write == fsnotify.Write, event.Op&fsnotify.Create == fsnotify.Create:
-					// reload the access entry file
-					logrus.Info("startLoadDynamicFile: got WRITE/CREATE event reload it the memory")
-					m.loadDynamicFile()
-				case event.Op&fsnotify.Rename == fsnotify.Rename, event.Op&fsnotify.Remove == fsnotify.Remove:
-					logrus.Info("startLoadDynamicFile: got RENAME/REMOVE event")
-					// test if the "REMOVE" is triggered by vi or cp cmd
-					_, err := os.Stat(m.filename)
-					if os.IsNotExist(err) {
-						// the "REMOVE" event is  not triggered by vi or cp cmd
-						// reset memory
-						userMappings := make([]config.UserMapping, 0)
-						roleMappings := make([]config.RoleMapping, 0)
-						awsAccounts := make([]string, 0)
-						m.saveMap(userMappings, roleMappings, awsAccounts)
-					}
-					return
-				}
-			case err := <-watcher.Errors:
-				logrus.Errorf("startLoadDynamicFile: watcher.Errors for dynamic file %v", err)
-			}
-		}
-	}, time.Second, stopCh)
-}
-
-func ParseMap(filename string) (userMappings []config.UserMapping, roleMappings []config.RoleMapping, awsAccounts []string, err error) {
-	errs := make([]error, 0)
-	userMappings = make([]config.UserMapping, 0)
-	roleMappings = make([]config.RoleMapping, 0)
-
-	dynamicContent, err := os.ReadFile(filename)
-	if err != nil {
-		logrus.Errorf("ParseMap: could not read from dynamic file")
-		return userMappings, roleMappings, awsAccounts, err
-	}
-
-	var dynamicFileData DynamicFileData
-	err = json.Unmarshal([]byte(dynamicContent), &dynamicFileData)
-	if err != nil {
-		if len(dynamicContent) == 0 {
-			return userMappings, roleMappings, awsAccounts, nil
-		}
-		logrus.Error("ParseMap: could not unmarshal dynamic file.")
-		return userMappings, roleMappings, awsAccounts, err
-	}
-
-	for _, userMapping := range dynamicFileData.UserMappings {
-		if userMapping.UserARN == "" {
-			errs = append(errs, fmt.Errorf("Value for userarn must be supplied"))
-		} else {
-			userMappings = append(userMappings, userMapping)
-		}
-	}
-
-	for _, roleMapping := range dynamicFileData.RoleMappings {
-		if roleMapping.RoleARN == "" {
-			errs = append(errs, fmt.Errorf("Value for rolearn must be supplied"))
-		} else {
-			roleMappings = append(roleMappings, roleMapping)
-		}
-	}
-
-	awsAccounts = dynamicFileData.AutoMappedAWSAccounts[:]
-
-	if len(errs) > 0 {
-		logrus.Warnf("ParseMap: Errors parsing dynamic file: %+v", errs)
-		err = ErrParsingMap{errors: errs}
-	}
-	return userMappings, roleMappings, awsAccounts, err
-}
 func (ms *DynamicFileMapStore) saveMap(
 	userMappings []config.UserMapping,
 	roleMappings []config.RoleMapping,
@@ -184,44 +76,47 @@ func (ms *DynamicFileMapStore) saveMap(
 	ms.awsAccounts = make(map[string]interface{})
 
 	for _, user := range userMappings {
-		canonicalizedARN, _ := arn.Canonicalize(strings.ToLower(user.UserARN))
-		ms.users[canonicalizedARN] = user
+		_, key, _ := arn.Canonicalize(strings.ToLower(user.UserARN))
+		if ms.userIDStrict {
+			key = user.UserId
+		}
+		ms.users[key] = user
 	}
 	for _, role := range roleMappings {
-		canonicalizedARN, _ := arn.Canonicalize(strings.ToLower(role.RoleARN))
-		ms.roles[canonicalizedARN] = role
+		_, key, _ := arn.Canonicalize(strings.ToLower(role.RoleARN))
+		if ms.userIDStrict {
+			key = role.UserId
+		}
+		ms.roles[key] = role
 	}
 	for _, awsAccount := range awsAccounts {
 		ms.awsAccounts[awsAccount] = nil
 	}
 }
 
-// UserNotFound is the error returned when the user is not found in the config map.
-var UserNotFound = errors.New("User not found in dynamic file")
-
-// RoleNotFound is the error returned when the role is not found in the config map.
-var RoleNotFound = errors.New("Role not found in dynamic file")
-
-func (ms *DynamicFileMapStore) UserMapping(arn string) (config.UserMapping, error) {
+// UserMapping returns the UserMapping for the given key, or ErrUserNotFound.
+func (ms *DynamicFileMapStore) UserMapping(key string) (config.UserMapping, error) {
 	ms.mutex.RLock()
 	defer ms.mutex.RUnlock()
-	if user, ok := ms.users[arn]; !ok {
-		return config.UserMapping{}, UserNotFound
-	} else {
-		return user, nil
+	user, ok := ms.users[key]
+	if !ok {
+		return config.UserMapping{}, errutil.ErrNotMapped
 	}
+	return user, nil
 }
 
-func (ms *DynamicFileMapStore) RoleMapping(arn string) (config.RoleMapping, error) {
+// RoleMapping returns the RoleMapping for the given key, or ErrRoleNotFound.
+func (ms *DynamicFileMapStore) RoleMapping(key string) (config.RoleMapping, error) {
 	ms.mutex.RLock()
 	defer ms.mutex.RUnlock()
-	if role, ok := ms.roles[arn]; !ok {
-		return config.RoleMapping{}, RoleNotFound
-	} else {
-		return role, nil
+	role, ok := ms.roles[key]
+	if !ok {
+		return config.RoleMapping{}, errutil.ErrNotMapped
 	}
+	return role, nil
 }
 
+// AWSAccount returns true if the given account ID is permitted.
 func (ms *DynamicFileMapStore) AWSAccount(id string) bool {
 	ms.mutex.RLock()
 	defer ms.mutex.RUnlock()
@@ -229,6 +124,7 @@ func (ms *DynamicFileMapStore) AWSAccount(id string) bool {
 	return ok
 }
 
+// LogMapping logs all current role and user mappings at debug level.
 func (ms *DynamicFileMapStore) LogMapping() {
 	ms.mutex.RLock()
 	defer ms.mutex.RUnlock()
@@ -238,7 +134,83 @@ func (ms *DynamicFileMapStore) LogMapping() {
 	for _, role := range ms.roles {
 		logrus.Info(role)
 	}
-	for awsAccount, _ := range ms.awsAccounts {
+	for awsAccount := range ms.awsAccounts {
 		logrus.Info(awsAccount)
 	}
+}
+
+// CallBackForFileLoad is invoked when the dynamic file is updated; it parses and reloads mappings.
+func (ms *DynamicFileMapStore) CallBackForFileLoad(dynamicContent []byte) error {
+	errs := make([]error, 0)
+	userMappings := make([]config.UserMapping, 0)
+	roleMappings := make([]config.RoleMapping, 0)
+	var dynamicFileData DynamicFileData
+	err := json.Unmarshal(dynamicContent, &dynamicFileData)
+	if err != nil {
+		logrus.Error("ParseMap: could not unmarshal dynamic file.")
+		return err
+	}
+
+	for _, userMapping := range dynamicFileData.UserMappings {
+		key := userMapping.UserARN
+		if ms.userIDStrict {
+			key = userMapping.UserId
+		}
+		if key == "" {
+			errs = append(errs, fmt.Errorf("value for userarn or userid(if dynamicfileUserIDStrict = true) must be supplied"))
+		} else {
+			userMappings = append(userMappings, userMapping)
+		}
+	}
+
+	for _, roleMapping := range dynamicFileData.RoleMappings {
+		key := roleMapping.RoleARN
+		if ms.userIDStrict {
+			key = roleMapping.UserId
+		}
+		if key == "" {
+			errs = append(errs, fmt.Errorf("value for rolearn or userid(if dynamicfileUserIDStrict = true) must be supplied"))
+		} else {
+			roleMappings = append(roleMappings, roleMapping)
+		}
+	}
+
+	awsAccounts := dynamicFileData.AutoMappedAWSAccounts
+
+	if len(errs) > 0 {
+		logrus.Warnf("ParseMap: Errors parsing dynamic file: %+v", errs)
+		err = ErrParsingMap{errors: errs}
+		return err
+	}
+	ms.saveMap(userMappings, roleMappings, awsAccounts)
+
+	// when instance or container restarts, the dynamic file is (re)loaded and the latency metric is calculated
+	// regardless if there was a change upstream, and thus can emit an incorrect latency value
+	// so a workaround is to skip the first time the metric is calculated, and only emit metris after
+	// as we know any subsequent calculations are from a valid change upstream
+	if ms.dynamicFileInitDone {
+		latency, err := fileutil.CalculateTimeDeltaFromUnixInSeconds(dynamicFileData.LastUpdatedDateTime)
+		if err != nil {
+			logrus.Errorf("error parsing latency for dynamic file: %v", err)
+		} else {
+			metrics.Get().E2ELatency.WithLabelValues("dynamic_file").Observe(float64(latency))
+			logrus.WithFields(logrus.Fields{
+				"Version": dynamicFileData.Version,
+				"Type":    "dynamic_file",
+				"Latency": latency,
+			}).Infof("logging latency metric")
+		}
+	}
+	ms.dynamicFileInitDone = true
+
+	return nil
+}
+
+// CallBackForFileDeletion is invoked when the dynamic file is deleted; it clears all mappings.
+func (ms *DynamicFileMapStore) CallBackForFileDeletion() error {
+	userMappings := make([]config.UserMapping, 0)
+	roleMappings := make([]config.RoleMapping, 0)
+	awsAccounts := make([]string, 0)
+	ms.saveMap(userMappings, roleMappings, awsAccounts)
+	return nil
 }

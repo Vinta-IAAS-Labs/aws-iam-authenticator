@@ -18,9 +18,8 @@ package server
 
 import (
 	"flag"
+	"os"
 	"testing"
-
-	"k8s.io/kubernetes/test/integration/framework"
 )
 
 var (
@@ -31,8 +30,8 @@ var (
 
 func TestMain(m *testing.M) {
 	flag.StringVar(&authenticatorBinaryPath, "authenticator-binary-path", "/usr/local/bin/aws-iam-authenticator", "Location of the aws-iam-authenticator binary to test with.")
-	flag.StringVar(&roleARN, "role-arn", "", "ARN of role to be authenticated in the test. This role ARN is added to the configmap and it should be assumable by the test run.")
+	flag.StringVar(&roleARN, "role-arn", "", "ARN of role to be authenticated in the test.")
 	flag.StringVar(&testArtifactsDir, "test-artifacts-dir", "", "Directory used for artifacts generated from test runs.")
-
-	framework.EtcdMain(m.Run)
+	flag.Parse()
+	os.Exit(m.Run())
 }

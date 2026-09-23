@@ -1,14 +1,17 @@
+// Package mapper defines the Mapper interface and backend mode constants for IAM identity mapping.
 package mapper
 
 import (
-	"errors"
 	"fmt"
+
+	"sigs.k8s.io/aws-iam-authenticator/pkg/token"
 
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/aws-iam-authenticator/pkg/config"
 )
 
+// Backend mode constants define the available IAM mapping backends.
 const (
 	// Deprecated: use ModeMountedFile instead
 	ModeFile string = "File"
@@ -24,6 +27,7 @@ const (
 	ModeDynamicFile string = "DynamicFile"
 )
 
+// ValidBackendModeChoices lists all valid backend mode identifiers.
 var (
 	ValidBackendModeChoices      = []string{ModeFile, ModeConfigMap, ModeMountedFile, ModeEKSConfigMap, ModeCRD, ModeDynamicFile}
 	DeprecatedBackendModeChoices = map[string]string{
@@ -33,16 +37,17 @@ var (
 	BackendModeChoices = []string{ModeMountedFile, ModeEKSConfigMap, ModeCRD, ModeDynamicFile}
 )
 
-var ErrNotMapped = errors.New("ARN is not mapped")
-
+// Mapper is the interface implemented by all IAM identity mapping backends.
 type Mapper interface {
 	Name() string
 	// Start must be non-blocking
 	Start(stopCh <-chan struct{}) error
-	Map(canonicalARN string) (*config.IdentityMapping, error)
+	Map(identity *token.Identity) (*config.IdentityMapping, error)
 	IsAccountAllowed(accountID string) bool
+	UsernamePrefixReserveList() []string
 }
 
+// ValidateBackendMode returns errors for any unrecognized backend mode strings.
 func ValidateBackendMode(modes []string) []error {
 	var errs []error
 

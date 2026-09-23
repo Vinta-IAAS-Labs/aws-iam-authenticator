@@ -1,3 +1,5 @@
+//go:build !no_verify
+
 /*
 Copyright 2017 by the contributors.
 
@@ -17,13 +19,16 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 
+	"sigs.k8s.io/aws-iam-authenticator/pkg/endpoints"
 	"sigs.k8s.io/aws-iam-authenticator/pkg/token"
 
-	"github.com/aws/aws-sdk-go/aws/endpoints"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
@@ -32,7 +37,7 @@ var verifyCmd = &cobra.Command{
 	Use:   "verify",
 	Short: "Verify a token for debugging purpose",
 	Long:  ``,
-	Run: func(cmd *cobra.Command, args []string) {
+	Run: func(cmd *cobra.Command, _ []string) {
 		tok := viper.GetString("token")
 		output := viper.GetString("output")
 		clusterID := viper.GetString("clusterID")
@@ -40,17 +45,23 @@ var verifyCmd = &cobra.Command{
 
 		if tok == "" {
 			fmt.Fprintf(os.Stderr, "error: token not specified\n")
-			cmd.Usage()
+			if err := cmd.Usage(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error displaying usage: %v\n", err)
+			}
 			os.Exit(1)
 		}
 
 		if clusterID == "" {
 			fmt.Fprintf(os.Stderr, "error: cluster ID not specified\n")
-			cmd.Usage()
+			if err := cmd.Usage(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error displaying usage: %v\n", err)
+			}
 			os.Exit(1)
 		}
 
-		id, err := token.NewVerifier(clusterID, partition).Verify(tok)
+		instanceRegion := getInstanceRegion(context.Background())
+
+		id, err := token.NewVerifier(clusterID, partition, instanceRegion).Verify(tok)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "could not verify token: %v\n", err)
 			os.Exit(1)
@@ -72,17 +83,39 @@ func init() {
 	rootCmd.AddCommand(verifyCmd)
 	verifyCmd.Flags().StringP("token", "t", "", "Token to verify")
 	verifyCmd.Flags().StringP("output", "o", "", "Output format. Only `json` is supported currently.")
-	viper.BindPFlag("token", verifyCmd.Flags().Lookup("token"))
-	viper.BindPFlag("output", verifyCmd.Flags().Lookup("output"))
-
-	partitionKeys := []string{}
-	for _, p := range endpoints.DefaultPartitions() {
-		partitionKeys = append(partitionKeys, p.ID())
+	if err := viper.BindPFlag("token", verifyCmd.Flags().Lookup("token")); err != nil {
+		fmt.Printf("Failed to bind flag '%s' - %+v\n", "token", err)
+		os.Exit(1)
+	}
+	if err := viper.BindPFlag("output", verifyCmd.Flags().Lookup("output")); err != nil {
+		fmt.Printf("Failed to bind flag '%s' - %+v\n", "output", err)
+		os.Exit(1)
 	}
 
 	verifyCmd.Flags().String("partition",
 		endpoints.AwsPartitionID,
-		fmt.Sprintf("The AWS partition. Must be one of: %v", partitionKeys))
-	viper.BindPFlag("partition", verifyCmd.Flags().Lookup("partition"))
+		fmt.Sprintf("The AWS partition. Must be one of: %v", endpoints.PARTITIONS))
+	if err := viper.BindPFlag("partition", verifyCmd.Flags().Lookup("partition")); err != nil {
+		fmt.Printf("Failed to bind flag '%s' - %+v\n", "partition", err)
+		os.Exit(1)
+	}
 
+}
+
+// Uses EC2 metadata to get the region. Returns "" if no region found.
+func getInstanceRegion(ctx context.Context) string {
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[Warn] Unable to create config for metadata client, err: %v", err)
+		panic(err)
+	}
+
+	imdsClient := imds.NewFromConfig(cfg)
+	getRegionOutput, err := imdsClient.GetRegion(ctx, &imds.GetRegionInput{})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[Warn] Region not found in instance metadata, err: %v\n", err)
+		return ""
+	}
+
+	return getRegionOutput.Region
 }

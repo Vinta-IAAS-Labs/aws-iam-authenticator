@@ -1,14 +1,22 @@
 package ec2provider
 
 import (
+	"context"
+	"errors"
+	"io"
+	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/aws/aws-sdk-go/service/ec2/ec2iface"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/prometheus/client_golang/prometheus"
 	"sigs.k8s.io/aws-iam-authenticator/pkg/metrics"
 )
@@ -18,25 +26,25 @@ const (
 )
 
 type mockEc2Client struct {
-	ec2iface.EC2API
-	Reservations []*ec2.Reservation
+	EC2API
+	Reservations []*ec2types.Reservation
 }
 
-func (c *mockEc2Client) DescribeInstances(in *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
+func (c *mockEc2Client) DescribeInstances(_ context.Context, in *ec2.DescribeInstancesInput, _ ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error) {
 	// simulate the time it takes for aws to return
 	time.Sleep(DescribeDelay * time.Millisecond)
-	var reservations []*ec2.Reservation
+	var reservations []ec2types.Reservation
 	for _, res := range c.Reservations {
-		var reservation ec2.Reservation
+		var reservation ec2types.Reservation
 		for _, inst := range res.Instances {
 			for _, id := range in.InstanceIds {
-				if aws.StringValue(id) == aws.StringValue(inst.InstanceId) {
+				if id == aws.ToString(inst.InstanceId) {
 					reservation.Instances = append(reservation.Instances, inst)
 				}
 			}
 		}
 		if len(reservation.Instances) > 0 {
-			reservations = append(reservations, &reservation)
+			reservations = append(reservations, reservation)
 		}
 	}
 	return &ec2.DescribeInstancesOutput{
@@ -45,11 +53,11 @@ func (c *mockEc2Client) DescribeInstances(in *ec2.DescribeInstancesInput) (*ec2.
 }
 
 func newMockedEC2ProviderImpl() *ec2ProviderImpl {
-	dnsCache := ec2PrivateDNSCache{
+	dnsCache := &ec2PrivateDNSCache{
 		cache: make(map[string]string),
 		lock:  sync.RWMutex{},
 	}
-	ec2Requests := ec2Requests{
+	ec2Requests := &ec2Requests{
 		set:  make(map[string]bool),
 		lock: sync.RWMutex{},
 	}
@@ -57,7 +65,7 @@ func newMockedEC2ProviderImpl() *ec2ProviderImpl {
 		ec2:                &mockEc2Client{},
 		privateDNSCache:    dnsCache,
 		ec2Requests:        ec2Requests,
-		instanceIdsChannel: make(chan string, maxChannelSize),
+		instanceIDsChannel: make(chan string, maxChannelSize),
 	}
 
 }
@@ -66,22 +74,22 @@ func TestGetPrivateDNSName(t *testing.T) {
 	metrics.InitMetrics(prometheus.NewRegistry())
 	ec2Provider := newMockedEC2ProviderImpl()
 	ec2Provider.ec2 = &mockEc2Client{Reservations: prepareSingleInstanceOutput()}
-	go ec2Provider.StartEc2DescribeBatchProcessing()
-	dns_name, err := ec2Provider.GetPrivateDNSName("ec2-1")
+	go ec2Provider.StartEc2DescribeBatchProcessing(context.TODO())
+	dnsName, err := ec2Provider.GetPrivateDNSName(context.TODO(), "ec2-1")
 	if err != nil {
 		t.Error("There is an error which is not expected when calling ec2 API with setting up mocks")
 	}
-	if dns_name != "ec2-dns-1" {
-		t.Errorf("want: %v, got: %v", "ec2-dns-1", dns_name)
+	if dnsName != "ec2-dns-1" {
+		t.Errorf("want: %v, got: %v", "ec2-dns-1", dnsName)
 	}
 }
 
-func prepareSingleInstanceOutput() []*ec2.Reservation {
-	reservations := []*ec2.Reservation{
+func prepareSingleInstanceOutput() []*ec2types.Reservation {
+	reservations := []*ec2types.Reservation{
 		{
 			Groups: nil,
-			Instances: []*ec2.Instance{
-				&ec2.Instance{
+			Instances: []ec2types.Instance{
+				{
 					InstanceId:     aws.String("ec2-1"),
 					PrivateDnsName: aws.String("ec2-dns-1"),
 				},
@@ -99,7 +107,7 @@ func TestGetPrivateDNSNameWithBatching(t *testing.T) {
 	ec2Provider := newMockedEC2ProviderImpl()
 	reservations := prepare100InstanceOutput()
 	ec2Provider.ec2 = &mockEc2Client{Reservations: reservations}
-	go ec2Provider.StartEc2DescribeBatchProcessing()
+	go ec2Provider.StartEc2DescribeBatchProcessing(context.TODO())
 	var wg sync.WaitGroup
 	for i := 1; i < 101; i++ {
 		instanceString := "ec2-" + strconv.Itoa(i)
@@ -116,7 +124,7 @@ func TestGetPrivateDNSNameWithBatching(t *testing.T) {
 
 func getPrivateDNSName(ec2provider *ec2ProviderImpl, instanceString string, dnsString string, t *testing.T, wg *sync.WaitGroup) {
 	defer wg.Done()
-	dnsName, err := ec2provider.GetPrivateDNSName(instanceString)
+	dnsName, err := ec2provider.GetPrivateDNSName(context.TODO(), instanceString)
 	if err != nil {
 		t.Error("There is an error which is not expected when calling ec2 API with setting up mocks")
 	}
@@ -125,20 +133,20 @@ func getPrivateDNSName(ec2provider *ec2ProviderImpl, instanceString string, dnsS
 	}
 }
 
-func prepare100InstanceOutput() []*ec2.Reservation {
+func prepare100InstanceOutput() []*ec2types.Reservation {
 
-	var reservations []*ec2.Reservation
+	var reservations []*ec2types.Reservation
 
 	for i := 1; i < 101; i++ {
 		instanceString := "ec2-" + strconv.Itoa(i)
 		dnsString := "ec2-dns-" + strconv.Itoa(i)
-		instance := &ec2.Instance{
+		instance := ec2types.Instance{
 			InstanceId:     aws.String(instanceString),
 			PrivateDnsName: aws.String(dnsString),
 		}
-		var instances []*ec2.Instance
+		var instances []ec2types.Instance
 		instances = append(instances, instance)
-		res1 := &ec2.Reservation{
+		res1 := &ec2types.Reservation{
 			Groups:        nil,
 			Instances:     instances,
 			OwnerId:       nil,
@@ -149,4 +157,271 @@ func prepare100InstanceOutput() []*ec2.Reservation {
 	}
 	return reservations
 
+}
+
+func TestGetSourceAcctAndArn(t *testing.T) {
+	type args struct {
+		roleARN string
+	}
+	tests := []struct {
+		name    string
+		args    args
+		want    string
+		wantErr bool
+	}{
+		{
+			name: "corect role arn",
+			args: args{
+				roleARN: "arn:aws:iam::123456789876:role/test-cluster",
+			},
+			want:    "123456789876",
+			wantErr: false,
+		},
+		{
+			name: "incorrect role arn",
+			args: args{
+				roleARN: "arn:aws:iam::123456789876",
+			},
+			want:    "",
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := getSourceAccount(tt.args.roleARN)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("GetSourceAccount() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("GetSourceAccount() got = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestApplySTSRequestHeaders(t *testing.T) {
+	tests := []struct {
+		name            string
+		headerSourceArn string
+		want            map[string]string
+		wantErr         bool
+	}{
+		{
+			name:            "header with source arn",
+			headerSourceArn: "arn:aws:eks:us-east-1:123456789012:MyCluster/res1",
+			want: map[string]string{
+				headerSourceAccount: "123456789012",
+				headerSourceArn:     "arn:aws:eks:us-east-1:123456789012:MyCluster/res1",
+			},
+			wantErr: false,
+		},
+		{
+			name:            "header without source arn",
+			headerSourceArn: "",
+			want: map[string]string{
+				headerSourceAccount: "",
+				headerSourceArn:     "",
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var capturedHeaders map[string]string
+			mockRT := &MockRoundTripper{
+				VerifyHeaders: func(headers http.Header) error {
+					capturedHeaders = make(map[string]string)
+					capturedHeaders[headerSourceAccount] = headers.Get(headerSourceAccount)
+					capturedHeaders[headerSourceArn] = headers.Get(headerSourceArn)
+					return nil
+				},
+			}
+
+			cfg := aws.Config{
+				Region: "us-west-2",
+				Credentials: aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider(
+					"AKID", "SECRET", "SESSION")),
+				HTTPClient: &http.Client{
+					Transport: mockRT,
+				},
+			}
+			stsClient := sts.NewFromConfig(*applySTSRequestHeaders(&cfg, tt.headerSourceArn))
+			_, err := stsClient.GetCallerIdentity(context.TODO(), &sts.GetCallerIdentityInput{})
+			if err != nil {
+				t.Errorf("error making sts client call, %v", err)
+			}
+
+			// Verify headers
+			for k, v := range tt.want {
+				if v != "" {
+					got, ok := capturedHeaders[k]
+					if !ok {
+						t.Errorf("header %s not found", k)
+						return
+					}
+					if got != v {
+						t.Errorf("header %s = %v, want %v", k, got, v)
+					}
+				}
+			}
+		})
+	}
+}
+
+type MockRoundTripper struct {
+	ExpectedHeaders map[string]string
+	VerifyHeaders   func(headers http.Header) error
+}
+
+func (m *MockRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err := m.VerifyHeaders(req.Header); err != nil {
+		return nil, err
+	}
+
+	resp := &http.Response{
+		StatusCode: 200,
+		Body:       nil,
+	}
+
+	return resp, nil
+}
+
+type statusRoundTripper struct {
+	status int
+	body   string
+	err    error
+}
+
+func (s *statusRoundTripper) RoundTrip(_ *http.Request) (*http.Response, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return &http.Response{
+		StatusCode: s.status,
+		Header:     make(http.Header),
+		// Body must be non-nil: the EC2 error deserializer io.Copy's from it.
+		Body: io.NopCloser(strings.NewReader(s.body)),
+	}, nil
+}
+
+func newTestEC2Client(rt http.RoundTripper) *ec2.Client {
+	cfg := aws.Config{
+		Region: "us-west-2",
+		Credentials: aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider(
+			"AKID", "SECRET", "SESSION")),
+		HTTPClient:       &http.Client{Transport: rt},
+		RetryMaxAttempts: 1,
+	}
+	return ec2.NewFromConfig(cfg)
+}
+
+func TestEc2ResponseCodeWithRealSDKError(t *testing.T) {
+	// Shape the real ec2query deserializer expects (Errors>Error>Code/Message).
+	errorBody := func(code, msg string) string {
+		return `<Response><Errors><Error><Code>` + code + `</Code><Message>` + msg +
+			`</Message></Error></Errors><RequestID>test-request-id</RequestID></Response>`
+	}
+
+	tests := []struct {
+		name string
+		rt   *statusRoundTripper
+		want string
+	}{
+		{
+			name: "400 throttling response",
+			rt: &statusRoundTripper{
+				status: 400,
+				body:   errorBody("RequestLimitExceeded", "Rate exceeded"),
+			},
+			want: "400",
+		},
+		{
+			name: "400 invalid instance id",
+			rt: &statusRoundTripper{
+				status: 400,
+				body:   errorBody("InvalidInstanceID.NotFound", "The instance ID does not exist"),
+			},
+			want: "400",
+		},
+		{
+			name: "403 unauthorized",
+			rt: &statusRoundTripper{
+				status: 403,
+				body:   errorBody("UnauthorizedOperation", "You are not authorized"),
+			},
+			want: "403",
+		},
+		{
+			name: "503 service unavailable",
+			rt: &statusRoundTripper{
+				status: 503,
+				body:   errorBody("ServiceUnavailable", "Service unavailable"),
+			},
+			want: "503",
+		},
+		{
+			name: "transport failure (no HTTP response)",
+			rt: &statusRoundTripper{
+				err: errors.New("dial tcp 10.0.0.1:443: connect: connection refused"),
+			},
+			want: "",
+		},
+		{
+			name: "200 success",
+			rt: &statusRoundTripper{
+				status: 200,
+				body:   "",
+			},
+			want: "200",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := newTestEC2Client(tt.rt)
+			output, err := client.DescribeInstances(context.TODO(), &ec2.DescribeInstancesInput{
+				InstanceIds: []string{"i-1234567890abcdef0"},
+			})
+			if err == nil {
+				if got := ec2SuccessResponseCode(output.ResultMetadata); got != tt.want {
+					t.Errorf("ec2SuccessResponseCode() = %q, want %q", got, tt.want)
+				}
+				return
+			}
+			if got := ec2ErrorResponseCode(err); got != tt.want {
+				t.Errorf("ec2ResponseCode() = %q, want %q (err was: %v)", got, tt.want, err)
+			}
+		})
+	}
+}
+
+func TestEc2ResponseCode(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "nil error",
+			err:  nil,
+			want: "",
+		},
+		{
+			name: "response error with zero status",
+			err: &smithyhttp.ResponseError{
+				Response: &smithyhttp.Response{Response: &http.Response{StatusCode: 0}},
+				Err:      errors.New("x"),
+			},
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ec2ErrorResponseCode(tt.err)
+			if got != tt.want {
+				t.Errorf("ec2ResponseCode() = %q, want %q", got, tt.want)
+			}
+		})
+	}
 }

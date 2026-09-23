@@ -25,10 +25,10 @@ KOPS_USERID=$(whoami)
 if [ $CI = true ]
 then
   REPO_NAME=${REPO_NAME:-aws-iam-authenticator-e2e}
-  KOPS_STATE_BUCKET=${KOPS_STATE_BUCKET:-k8s-kops-auth-e2e}
+  KOPS_STATE_BUCKET=${KOPS_STATE_BUCKET:-k8s-kops-aws-iam-authenticator-shared-e2e}
 else
   REPO_NAME=${REPO_NAME:-aws-iam-authenticator}
-  KOPS_STATE_BUCKET=${KOPS_STATE_BUCKET:-k8s-kops-auth-${KOPS_USERID}}
+  KOPS_STATE_BUCKET=${KOPS_STATE_BUCKET:-k8s-kops-aws-iam-authenticator-${KOPS_USERID}}
 fi
 
 TEST_ID=${TEST_ID:-$RANDOM}
@@ -54,19 +54,19 @@ ECR_URL=${AWS_ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com
 IMAGE_NAME=${IMAGE_NAME:-${ECR_URL}/${REPO_NAME}}
 IMAGE_TAG=${IMAGE_TAG:-${TEST_ID}}
 
-K8S_VERSION=${K8S_VERSION:-1.22.10}
+K8S_VERSION=${K8S_VERSION:-1.31.0}
 
-KOPS_VERSION=${KOPS_VERSION:-1.23.0}
+KOPS_VERSION=${KOPS_VERSION:-1.32.0}
 
 KOPS_STATE_FILE=${KOPS_STATE_FILE:-s3://${KOPS_STATE_BUCKET}}
 KOPS_PATCH_FILE=${KOPS_PATCH_FILE:-${BASE_DIR}/kops-patch.yaml}
 
-ROLE_PREFIX=${ROLE_PREFIX:-"aws-iam-authenticator-test-role-"}
+ROLE_PREFIX=${ROLE_PREFIX:-"aws-iam-authenticator-test-role-${RANDOM}-"}
 ROLES_SPEC_FILE=${ROLES_SPEC_FILE:-${BASE_DIR}/roles.yaml}
 APISERVER_UPDATE_FILE=${APISERVER_UPDATE_FILE:-${BASE_DIR}/apiserver-update.yaml}
 KUBECONFIG_UPDATE_FILE=${KUBECONFIG_UPDATE_FILE:-${BASE_DIR}/kubeconfig-update.yaml}
 
-KUBECTL_VERSION=${KUBECTL_VERSION:-1.24.0}
+KUBECTL_VERSION=${KUBECTL_VERSION:-1.31.0}
 
 TEST_PATH=${TEST_PATH:-"./..."}
 ARTIFACTS=${ARTIFACTS:-"${TEST_DIR}/artifacts"}
@@ -100,7 +100,7 @@ loudecho "Installing ginkgo to ${BIN_DIR}"
 GINKGO_BIN=${BIN_DIR}/ginkgo
 if [[ ! -e ${GINKGO_BIN} ]]; then
   pushd /tmp
-  GOPATH=${TEST_DIR} GOBIN=${BIN_DIR} GO111MODULE=on go install github.com/onsi/ginkgo/ginkgo@v1.12.0
+  GOPATH=${TEST_DIR} GOBIN=${BIN_DIR} GO111MODULE=on go install github.com/onsi/ginkgo/v2/ginkgo@latest
   popd
 fi
 
@@ -241,7 +241,7 @@ eval "EXPANDED_TEST_EXTRA_FLAGS=$TEST_EXTRA_FLAGS"
 set -x
 set +e
 pushd tests/e2e
-BASE_DIR=${BASE_DIR} CLUSTER_NAME=${CLUSTER_NAME} ADMIN_ROLE=${ADMIN_ROLE} AUTHENTICATOR_BIN=${AUTHENTICATOR_BIN} USER_ROLE=${USER_ROLE} ${GINKGO_BIN} -p -nodes="${GINKGO_NODES}" -v --focus="${GINKGO_FOCUS}" --skip="${GINKGO_SKIP}" "${TEST_PATH}" -- -kubeconfig="${KUBECONFIG_ADMIN}" -report-dir="${ARTIFACTS}" -gce-zone="${FIRST_ZONE}" "${EXPANDED_TEST_EXTRA_FLAGS}"
+BASE_DIR=${BASE_DIR} CLUSTER_NAME=${CLUSTER_NAME} ADMIN_ROLE=${ADMIN_ROLE} AUTHENTICATOR_BIN=${AUTHENTICATOR_BIN} USER_ROLE=${USER_ROLE} ${GINKGO_BIN} -p -nodes="${GINKGO_NODES}" -v --focus="${GINKGO_FOCUS}" --skip="${GINKGO_SKIP}" "${TEST_PATH}" -- -kubeconfig="${KUBECONFIG_ADMIN}" -report-dir="${ARTIFACTS}" "${EXPANDED_TEST_EXTRA_FLAGS}"
 TEST_PASSED=$?
 popd
 set -e

@@ -16,6 +16,7 @@ limitations under the License.
 
 package config
 
+// IdentityMapping is the result of mapping an IAM identity to a Kubernetes identity.
 type IdentityMapping struct {
 	IdentityARN string
 
@@ -57,6 +58,9 @@ type RoleMapping struct {
 	// Groups is a list of Kubernetes groups this role will authenticate
 	// as (e.g., `system:masters`). Each group name can include placeholders.
 	Groups []string `json:"groups" yaml:"groups"`
+
+	// UserId is the AWS PrincipalId of the role. (e.g., "ABCXSOTJDDV").
+	UserId string `json:"userid,omitempty" yaml:"userid,omitempty"` //nolint:revive // var-naming: field name preserved for JSON compatibility
 }
 
 // UserMapping is a static mapping of a single AWS User ARN to a
@@ -70,6 +74,9 @@ type UserMapping struct {
 
 	// Groups is a list of Kubernetes groups this role will authenticate as (e.g., `system:masters`)
 	Groups []string `json:"groups" yaml:"groups"`
+
+	// UserId is the AWS PrincipalId of the user. (e.g., "ABCXSOTJDDV").
+	UserId string `json:"userid,omitempty" yaml:"userid,omitempty"` //nolint:revive // var-naming: field name preserved for JSON compatibility
 }
 
 // SSOARNMatcher contains fields used to match Role ARNs that
@@ -114,6 +121,10 @@ type Config struct {
 	// HostPort is the TCP Port on which to listen for authentication checks.
 	HostPort int
 
+	// HealthPort is the TCP port on which to serve the /healthz endpoint.
+	// Defaults to 21363 if zero.
+	HealthPort int
+
 	// Hostname is the address clients should use for this server.
 	Hostname string
 
@@ -149,6 +160,12 @@ type Config struct {
 	// running.
 	ServerEC2DescribeInstancesRoleARN string
 
+	// SourceARN is value which is passed while assuming role specified by ServerEC2DescribeInstancesRoleARN.
+	// When a service assumes a role in your account, you can include the aws:SourceAccount and aws:SourceArn global
+	// condition context keys in your role trust policy to limit access to the role to only requests that are generated
+	// by expected resources. https://docs.aws.amazon.com/IAM/latest/UserGuide/confused-deputy.html
+	SourceARN string
+
 	// Address defines the hostname or IP Address to bind the HTTPS server to listen to. This is useful when creating
 	// a local server to handle the authentication request for development.
 	Address string
@@ -162,13 +179,27 @@ type Config struct {
 	// +optional
 	Kubeconfig string
 
-	// BackendMode is an ordered list of backends to get mappings from. Comma-delimited list of: MountedFile,EKSConfigMap,CRD
+	// BackendMode is an ordered list of backends to get mappings from. Comma-delimited list of: MountedFile,EKSConfigMap,CRD,DynamicFile
 	BackendMode []string
 
 	// Ec2 DescribeInstances rate limiting variables initially set to defaults until we completely
 	// understand we don't need to change
-	EC2DescribeInstancesQps   int
+	EC2DescribeInstancesQps   int //nolint:revive // var-naming: field name preserved for backwards compatibility
 	EC2DescribeInstancesBurst int
-	//Dynamic File Path for DynamicFile BackendMode
+	// Dynamic File Path for DynamicFile BackendMode
 	DynamicFilePath string
+	// Use UserId for mapping, IdentityArn is not used any more when DynamicFileUserIDStrict=true
+	DynamicFileUserIDStrict bool
+	// ReservedPrefixConfig defines reserved username prefixes for each backend
+	ReservedPrefixConfig map[string]ReservedPrefixConfig
+	// Dynamic File Path for BackendMode
+	DynamicBackendModePath string
+}
+
+// ReservedPrefixConfig holds configuration for username prefix reservation.
+type ReservedPrefixConfig struct {
+	// Backend mode defined in Config.BackendMode
+	BackendMode string `json:"backendmode" yaml:"backendmode"`
+	// Defines the reserved prefixes for kubernetes username
+	UsernamePrefixReserveList []string `json:"usernamePrefixReserveList,omitempty" yaml:"usernamePrefixReserveList,omitempty"`
 }

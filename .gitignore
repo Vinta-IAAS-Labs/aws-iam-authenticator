@@ -1,11 +1,19 @@
 aws-iam-authenticator
 
+bin
+
 /dist
 /_output
 
 # For testing
 test-artifacts
 hack/e2e/e2e-test-artifacts
+
+# Integration test server artifacts
+tests/integration/server/apiserver.kubeconfig
+tests/integration/server/cert.pem
+tests/integration/server/key.pem
+tests/integration/server/webhook.kubeconfig
 
 # == kubernetes .gitignore ==
 
@@ -69,3 +77,7 @@ cscope.*
 # coverage.out file
 coverage.out
 coverage.html
+
+# Go workspace lock file (auto-generated, environment-specific)
+go.work.sum
+

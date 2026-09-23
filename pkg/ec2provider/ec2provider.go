@@ -1,21 +1,22 @@
+// Package ec2provider implements EC2 instance detail lookup for the aws-iam-authenticator.
 package ec2provider
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
-	"github.com/aws/aws-sdk-go/aws/ec2metadata"
-	"github.com/aws/aws-sdk-go/aws/endpoints"
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/aws/aws-sdk-go/service/ec2/ec2iface"
-	"github.com/aws/aws-sdk-go/service/sts"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/arn"
+	"github.com/aws/aws-sdk-go-v2/aws/middleware"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+	smithymiddleware "github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/sirupsen/logrus"
 	"sigs.k8s.io/aws-iam-authenticator/pkg"
 	"sigs.k8s.io/aws-iam-authenticator/pkg/httputil"
@@ -36,12 +37,22 @@ const (
 	// Maximum time in Milliseconds to wait for a new batch call this also depends on if the instance size has
 	// already become 100 then it will not respect this limit
 	maxWaitIntervalForBatch = 200
+
+	// Headers for STS request for source ARN
+	headerSourceArn = "x-amz-source-arn"
+	// Headers for STS request for source account
+	headerSourceAccount = "x-amz-source-account"
 )
 
-// Get a node name from instance ID
+// EC2API defines the interface for EC2 client operations
+type EC2API interface {
+	DescribeInstances(ctx context.Context, params *ec2.DescribeInstancesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error)
+}
+
+// EC2Provider looks up EC2 instance details by instance ID.
 type EC2Provider interface {
-	GetPrivateDNSName(string) (string, error)
-	StartEc2DescribeBatchProcessing()
+	GetPrivateDNSName(ctx context.Context, id string) (string, error)
+	StartEc2DescribeBatchProcessing(ctx context.Context)
 }
 
 type ec2PrivateDNSCache struct {
@@ -55,47 +66,59 @@ type ec2Requests struct {
 }
 
 type ec2ProviderImpl struct {
-	ec2                ec2iface.EC2API
-	privateDNSCache    ec2PrivateDNSCache
-	ec2Requests        ec2Requests
-	instanceIdsChannel chan string
+	ec2                EC2API
+	privateDNSCache    *ec2PrivateDNSCache
+	ec2Requests        *ec2Requests
+	instanceIDsChannel chan string
+	region             string
 }
 
-func New(roleARN string, qps int, burst int) EC2Provider {
-	dnsCache := ec2PrivateDNSCache{
+func ec2ErrorResponseCode(err error) string {
+	var respErr *smithyhttp.ResponseError
+	if errors.As(err, &respErr) {
+		if code := respErr.HTTPStatusCode(); code != 0 {
+			return fmt.Sprint(code)
+		}
+	}
+	return ""
+}
+
+func ec2SuccessResponseCode(metadata smithymiddleware.Metadata) string {
+	if raw, ok := middleware.GetRawResponse(metadata).(*smithyhttp.Response); ok {
+		return fmt.Sprint(raw.StatusCode)
+	}
+	return "200"
+}
+
+// New creates and starts a new EC2Provider that resolves instance IDs to private DNS names.
+func New(ctx context.Context, roleARN, sourceARN, region string, qps int, burst int) EC2Provider {
+	dnsCache := &ec2PrivateDNSCache{
 		cache: make(map[string]string),
 		lock:  sync.RWMutex{},
 	}
-	ec2Requests := ec2Requests{
+	ec2Requests := &ec2Requests{
 		set:  make(map[string]bool),
 		lock: sync.RWMutex{},
 	}
 	return &ec2ProviderImpl{
-		ec2:                ec2.New(newSession(roleARN, qps, burst)),
+		ec2:                newEC2Client(ctx, roleARN, sourceARN, region, qps, burst),
 		privateDNSCache:    dnsCache,
 		ec2Requests:        ec2Requests,
-		instanceIdsChannel: make(chan string, maxChannelSize),
+		instanceIDsChannel: make(chan string, maxChannelSize),
+		region:             region,
 	}
 }
 
-// Initial credentials loaded from SDK's default credential chain, such as
-// the environment, shared credentials (~/.aws/credentials), or EC2 Instance
-// Role.
-
-func newSession(roleARN string, qps int, burst int) *session.Session {
-	sess := session.Must(session.NewSession())
-	sess.Handlers.Build.PushFrontNamed(request.NamedHandler{
-		Name: "authenticatorUserAgent",
-		Fn: request.MakeAddToUserAgentHandler(
-			"aws-iam-authenticator", pkg.Version),
-	})
-	if aws.StringValue(sess.Config.Region) == "" {
-		ec2metadata := ec2metadata.New(sess)
-		regionFound, err := ec2metadata.Region()
-		if err != nil {
-			logrus.WithError(err).Fatal("Region not found in shared credentials, environment variable, or instance metadata.")
-		}
-		sess.Config.Region = aws.String(regionFound)
+func newEC2Client(ctx context.Context, roleARN, sourceARN, region string, qps int, burst int) EC2API {
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		logrus.Fatalf("Failed to load AWS config: %v", err)
+	}
+	cfg.APIOptions = append(cfg.APIOptions,
+		middleware.AddUserAgentKeyValue("aws-iam-authenticator", pkg.Version),
+	)
+	if cfg.Region == "" {
+		cfg.Region = region
 	}
 
 	if roleARN != "" {
@@ -109,15 +132,18 @@ func newSession(roleARN string, qps int, burst int) *session.Session {
 			logrus.Errorf("Getting error = %s while creating rate limited client ", err)
 		}
 
-		ap := &stscreds.AssumeRoleProvider{
-			Client:   sts.New(sess, aws.NewConfig().WithHTTPClient(rateLimitedClient).WithSTSRegionalEndpoint(endpoints.RegionalSTSEndpoint)),
-			RoleARN:  roleARN,
-			Duration: time.Duration(60) * time.Minute,
-		}
+		stsCfg := cfg
+		stsCfg.HTTPClient = rateLimitedClient
 
-		sess.Config.Credentials = credentials.NewCredentials(ap)
+		stsClient := sts.NewFromConfig(*applySTSRequestHeaders(&stsCfg, sourceARN))
+		ap := stscreds.NewAssumeRoleProvider(stsClient, roleARN, func(o *stscreds.AssumeRoleOptions) {
+			o.Duration = time.Duration(60) * time.Minute
+		})
+
+		cfg.Credentials = aws.NewCredentialsCache(ap)
 	}
-	return sess
+
+	return ec2.NewFromConfig(cfg)
 }
 
 func (p *ec2ProviderImpl) setPrivateDNSNameCache(id string, privateDNSName string) {
@@ -126,19 +152,19 @@ func (p *ec2ProviderImpl) setPrivateDNSNameCache(id string, privateDNSName strin
 	p.privateDNSCache.cache[id] = privateDNSName
 }
 
-func (p *ec2ProviderImpl) setRequestInFlightForInstanceId(id string) {
+func (p *ec2ProviderImpl) setRequestInFlightForInstanceID(id string) {
 	p.ec2Requests.lock.Lock()
 	defer p.ec2Requests.lock.Unlock()
 	p.ec2Requests.set[id] = true
 }
 
-func (p *ec2ProviderImpl) unsetRequestInFlightForInstanceId(id string) {
+func (p *ec2ProviderImpl) unsetRequestInFlightForInstanceID(id string) {
 	p.ec2Requests.lock.Lock()
 	defer p.ec2Requests.lock.Unlock()
 	delete(p.ec2Requests.set, id)
 }
 
-func (p *ec2ProviderImpl) getRequestInFlightForInstanceId(id string) bool {
+func (p *ec2ProviderImpl) getRequestInFlightForInstanceID(id string) bool {
 	p.ec2Requests.lock.RLock()
 	defer p.ec2Requests.lock.RUnlock()
 	_, ok := p.ec2Requests.set[id]
@@ -164,14 +190,14 @@ func (p *ec2ProviderImpl) getPrivateDNSNameCache(id string) (string, error) {
 }
 
 // Only calls API if its not in the cache
-func (p *ec2ProviderImpl) GetPrivateDNSName(id string) (string, error) {
+func (p *ec2ProviderImpl) GetPrivateDNSName(ctx context.Context, id string) (string, error) {
 	privateDNSName, err := p.getPrivateDNSNameCache(id)
 	if err == nil {
 		return privateDNSName, nil
 	}
 	logrus.Debugf("Missed the cache for the InstanceId = %s Verifying if its already in requestQueue ", id)
-	// check if the request for instanceId already in queue.
-	if p.getRequestInFlightForInstanceId(id) {
+	// check if the request for instanceID already in queue.
+	if p.getRequestInFlightForInstanceID(id) {
 		logrus.Debugf("Found the InstanceId:= %s request In Queue waiting in 5 seconds loop ", id)
 		for i := 0; i < totalIterationForWaitInterval; i++ {
 			time.Sleep(defaultWaitInterval)
@@ -183,32 +209,38 @@ func (p *ec2ProviderImpl) GetPrivateDNSName(id string) (string, error) {
 		return "", fmt.Errorf("failed to find node %s in PrivateDNSNameCache returning from loop", id)
 	}
 	logrus.Debugf("Missed the requestQueue cache for the InstanceId = %s", id)
-	p.setRequestInFlightForInstanceId(id)
+	p.setRequestInFlightForInstanceID(id)
 	requestQueueLength := p.getRequestInFlightSize()
-	//The code verifies if the requestQuqueMap size is greater than max request in flight with rate
-	//limiting then writes to the channel where we are making batch ec2:DescribeInstances API call.
+	// The code verifies if the requestQuqueMap size is greater than max request in flight with rate
+	// limiting then writes to the channel where we are making batch ec2:DescribeInstances API call.
 	if requestQueueLength > maxAllowedInflightRequest {
 		logrus.Debugf("Writing to buffered channel for instance Id %s ", id)
-		p.instanceIdsChannel <- id
-		return p.GetPrivateDNSName(id)
+		p.instanceIDsChannel <- id
+		return p.GetPrivateDNSName(ctx, id)
 	}
 
 	logrus.Infof("Calling ec2:DescribeInstances for the InstanceId = %s ", id)
 	metrics.Get().EC2DescribeInstanceCallCount.Inc()
 	// Look up instance from EC2 API
-	output, err := p.ec2.DescribeInstances(&ec2.DescribeInstancesInput{
-		InstanceIds: aws.StringSlice([]string{id}),
+	output, err := p.ec2.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+		InstanceIds: []string{id},
 	})
 	if err != nil {
-		p.unsetRequestInFlightForInstanceId(id)
+		if code := ec2ErrorResponseCode(err); code != "" {
+			metrics.Get().EC2Responses.WithLabelValues(code, p.region).Inc()
+		} else {
+			metrics.Get().EC2ConnectionFailure.WithLabelValues(p.region).Inc()
+		}
+		p.unsetRequestInFlightForInstanceID(id)
 		return "", fmt.Errorf("failed querying private DNS from EC2 API for node %s: %s ", id, err.Error())
 	}
+	metrics.Get().EC2Responses.WithLabelValues(ec2SuccessResponseCode(output.ResultMetadata), p.region).Inc()
 	for _, reservation := range output.Reservations {
 		for _, instance := range reservation.Instances {
-			if aws.StringValue(instance.InstanceId) == id {
-				privateDNSName = aws.StringValue(instance.PrivateDnsName)
+			if aws.ToString(instance.InstanceId) == id {
+				privateDNSName = aws.ToString(instance.PrivateDnsName)
 				p.setPrivateDNSNameCache(id, privateDNSName)
-				p.unsetRequestInFlightForInstanceId(id)
+				p.unsetRequestInFlightForInstanceID(id)
 			}
 		}
 	}
@@ -219,19 +251,19 @@ func (p *ec2ProviderImpl) GetPrivateDNSName(id string) (string, error) {
 	return privateDNSName, nil
 }
 
-func (p *ec2ProviderImpl) StartEc2DescribeBatchProcessing() {
+func (p *ec2ProviderImpl) StartEc2DescribeBatchProcessing(ctx context.Context) {
 	startTime := time.Now()
-	var instanceIdList []string
+	var instanceIDList []string
 	for {
-		var instanceId string
+		var instanceID string
 		select {
-		case instanceId = <-p.instanceIdsChannel:
-			logrus.Debugf("Received the Instance Id := %s from buffered Channel for batch processing ", instanceId)
-			instanceIdList = append(instanceIdList, instanceId)
+		case instanceID = <-p.instanceIDsChannel:
+			logrus.Debugf("Received the Instance Id := %s from buffered Channel for batch processing ", instanceID)
+			instanceIDList = append(instanceIDList, instanceID)
 		default:
 			// Waiting for more elements to get added to the buffered Channel
 			// And to support the for select loop.
-			time.Sleep(20 * time.Millisecond)
+			time.Sleep(20 * time.Millisecond) //nolint:gosec // G118: intentional polling loop; ctx cancellation is handled by the caller via stopCh
 		}
 		endTime := time.Now()
 		/*
@@ -243,26 +275,32 @@ func (p *ec2ProviderImpl) StartEc2DescribeBatchProcessing() {
 			optimization here. Also for FYI we have client level rate limiting which is what this
 			ec2:DescribeInstances call will make so this call is also rate limited.
 		*/
-		if (len(instanceIdList) > 0 && (endTime.Sub(startTime).Milliseconds()) > maxWaitIntervalForBatch) || len(instanceIdList) > maxInstancesBatchSize {
+		if (len(instanceIDList) > 0 && (endTime.Sub(startTime).Milliseconds()) > maxWaitIntervalForBatch) || len(instanceIDList) > maxInstancesBatchSize {
 			startTime = time.Now()
-			dupInstanceList := make([]string, len(instanceIdList))
-			copy(dupInstanceList, instanceIdList)
-			go p.getPrivateDnsAndPublishToCache(dupInstanceList)
-			instanceIdList = nil
+			dupInstanceList := make([]string, len(instanceIDList))
+			copy(dupInstanceList, instanceIDList)
+			go p.getPrivateDNSAndPublishToCache(ctx, dupInstanceList)
+			instanceIDList = nil
 		}
 	}
 }
 
-func (p *ec2ProviderImpl) getPrivateDnsAndPublishToCache(instanceIdList []string) {
+func (p *ec2ProviderImpl) getPrivateDNSAndPublishToCache(ctx context.Context, instanceIDList []string) {
 	// Look up instance from EC2 API
-	logrus.Infof("Making Batch Query to DescribeInstances for %v instances ", len(instanceIdList))
+	logrus.Infof("Making Batch Query to DescribeInstances for %v instances ", len(instanceIDList))
 	metrics.Get().EC2DescribeInstanceCallCount.Inc()
-	output, err := p.ec2.DescribeInstances(&ec2.DescribeInstancesInput{
-		InstanceIds: aws.StringSlice(instanceIdList),
+	output, err := p.ec2.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+		InstanceIds: instanceIDList,
 	})
 	if err != nil {
-		logrus.Errorf("Batch call failed querying private DNS from EC2 API for nodes [%s] : with error = []%s ", instanceIdList, err.Error())
+		logrus.Errorf("Batch call failed querying private DNS from EC2 API for nodes [%s] : with error = []%s ", instanceIDList, err.Error())
+		if code := ec2ErrorResponseCode(err); code != "" {
+			metrics.Get().EC2Responses.WithLabelValues(code, p.region).Inc()
+		} else {
+			metrics.Get().EC2ConnectionFailure.WithLabelValues(p.region).Inc()
+		}
 	} else {
+		metrics.Get().EC2Responses.WithLabelValues(ec2SuccessResponseCode(output.ResultMetadata), p.region).Inc()
 		if output.NextToken != nil {
 			logrus.Debugf("Successfully got the batch result , output.NextToken = %s ", *output.NextToken)
 		} else {
@@ -271,15 +309,63 @@ func (p *ec2ProviderImpl) getPrivateDnsAndPublishToCache(instanceIdList []string
 		// Adding the result to privateDNSChache as well as removing from the requestQueueMap.
 		for _, reservation := range output.Reservations {
 			for _, instance := range reservation.Instances {
-				id := aws.StringValue(instance.InstanceId)
-				privateDNSName := aws.StringValue(instance.PrivateDnsName)
+				id := aws.ToString(instance.InstanceId)
+				privateDNSName := aws.ToString(instance.PrivateDnsName)
 				p.setPrivateDNSNameCache(id, privateDNSName)
 			}
 		}
 	}
 
 	logrus.Debugf("Removing instances from request Queue after getting response from Ec2")
-	for _, id := range instanceIdList {
-		p.unsetRequestInFlightForInstanceId(id)
+	for _, id := range instanceIDList {
+		p.unsetRequestInFlightForInstanceID(id)
 	}
+}
+
+func applySTSRequestHeaders(stsCfg *aws.Config, sourceARN string) *aws.Config {
+	// parse both source account and source arn from the sourceARN, and add them as headers to the STS client
+	if sourceARN != "" {
+		sourceAcct, err := getSourceAccount(sourceARN)
+		if err != nil {
+			panic(fmt.Sprintf("%s is not a valid arn, err: %v", sourceARN, err))
+		}
+		reqHeaders := map[string]string{
+			headerSourceAccount: sourceAcct,
+			headerSourceArn:     sourceARN,
+		}
+		// Add headers to STS API calls
+		stsCfg.APIOptions = append(stsCfg.APIOptions, func(stack *smithymiddleware.Stack) error {
+			return stack.Build.Add(smithymiddleware.BuildMiddlewareFunc("STSHeaderMiddleware", func(
+				ctx context.Context, in smithymiddleware.BuildInput, next smithymiddleware.BuildHandler,
+			) (smithymiddleware.BuildOutput, smithymiddleware.Metadata, error) {
+				req, ok := in.Request.(*smithyhttp.Request)
+				if ok {
+					req.Header.Set(headerSourceAccount, reqHeaders[headerSourceAccount])
+					req.Header.Set(headerSourceArn, reqHeaders[headerSourceArn])
+				}
+				return next.HandleBuild(ctx, in)
+			}), smithymiddleware.Before)
+		})
+
+		logrus.Infof("configuring STS client with extra headers, %v", reqHeaders)
+	}
+	return stsCfg
+}
+
+// getSourceAccount constructs source acct and return them for use
+func getSourceAccount(roleARN string) (string, error) {
+	// ARN format (https://docs.aws.amazon.com/IAM/latest/UserGuide/reference-arns.html)
+	// arn:partition:service:region:account-id:resource-type/resource-id
+	// IAM format, region is always blank
+	// arn:aws:iam::account:role/role-name-with-path
+	if !arn.IsARN(roleARN) {
+		return "", fmt.Errorf("incorrect ARN format for role %s", roleARN)
+	}
+
+	parsedArn, err := arn.Parse(roleARN)
+	if err != nil {
+		return "", err
+	}
+
+	return parsedArn.AccountID, nil
 }

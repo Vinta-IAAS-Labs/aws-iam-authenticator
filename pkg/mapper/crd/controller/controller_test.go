@@ -3,7 +3,9 @@ Copyright 2017 The Kubernetes Authors.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-    http://www.apache.org/licenses/LICENSE-2.0
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -75,7 +77,7 @@ func newIAMIdentityMapping(name, arn, username string) *iamauthenticatorv1alpha1
 
 func (f *fixture) newController() (*Controller, informers.SharedInformerFactory) {
 	f.client = fake.NewSimpleClientset(f.objects...)
-	f.kubeclient = k8sfake.NewSimpleClientset(f.kubeobjects...)
+	f.kubeclient = k8sfake.NewClientset(f.kubeobjects...)
 
 	i := informers.NewSharedInformerFactory(f.client, noResyncPeriodFunc())
 
@@ -85,7 +87,7 @@ func (f *fixture) newController() (*Controller, informers.SharedInformerFactory)
 	c.recorder = &record.FakeRecorder{}
 
 	for _, f := range f.iamIdentityLister {
-		i.Iamauthenticator().V1alpha1().IAMIdentityMappings().Informer().GetIndexer().Add(f)
+		_ = i.Iamauthenticator().V1alpha1().IAMIdentityMappings().Informer().GetIndexer().Add(f)
 	}
 
 	return c, i
@@ -93,10 +95,6 @@ func (f *fixture) newController() (*Controller, informers.SharedInformerFactory)
 
 func (f *fixture) run(iamIdentityName string) {
 	f.runController(iamIdentityName, true, false)
-}
-
-func (f *fixture) runExpectError(iamIdentityName string) {
-	f.runController(iamIdentityName, true, true)
 }
 
 func (f *fixture) runController(iamIdentityName string, startInformers bool, expectError bool) {
@@ -145,7 +143,7 @@ func (f *fixture) runController(iamIdentityName string, startInformers bool, exp
 }
 
 func checkAction(expected, actual core.Action, t *testing.T) {
-	if !(expected.Matches(actual.GetVerb(), actual.GetResource().Resource) && actual.GetSubresource() == expected.GetSubresource()) {
+	if !expected.Matches(actual.GetVerb(), actual.GetResource().Resource) || actual.GetSubresource() != expected.GetSubresource() {
 		t.Errorf("expected\n\t%#v\ngot\n\t%#v", expected, actual)
 		return
 	}
@@ -163,16 +161,7 @@ func checkAction(expected, actual core.Action, t *testing.T) {
 
 		if !reflect.DeepEqual(expObject, object) {
 			t.Errorf("action %s %s has wrong object\nDiff:\n %s",
-				a.GetVerb(), a.GetResource().Resource, diff.ObjectGoPrintDiff(expObject, object))
-		}
-	case core.UpdateAction:
-		e, _ := expected.(core.UpdateAction)
-		expObject := e.GetObject()
-		object := a.GetObject()
-
-		if !reflect.DeepEqual(expObject, object) {
-			t.Errorf("action %s %s has wrong object\nDiff:\n %s",
-				a.GetVerb(), a.GetResource().Resource, diff.ObjectGoPrintDiff(expObject, object))
+				a.GetVerb(), a.GetResource().Resource, diff.ObjectGoPrintSideBySide(expObject, object))
 		}
 	case core.PatchAction:
 		e, _ := expected.(core.PatchAction)
@@ -181,7 +170,7 @@ func checkAction(expected, actual core.Action, t *testing.T) {
 
 		if !reflect.DeepEqual(expPatch, patch) {
 			t.Errorf("action %s %s has wrong patch\nDiff:\n %s",
-				a.GetVerb(), a.GetResource().Resource, diff.ObjectGoPrintDiff(expPatch, patch))
+				a.GetVerb(), a.GetResource().Resource, diff.ObjectGoPrintSideBySide(expPatch, patch))
 		}
 	}
 }
@@ -200,18 +189,8 @@ func filterInformerActions(actions []core.Action) []core.Action {
 	return ret
 }
 
-func (f *fixture) expectUpdateAction(iamidentity *iamauthenticatorv1alpha1.IAMIdentityMapping) {
-	action := core.NewRootUpdateAction(schema.GroupVersionResource{Group: iamauthenticator.GroupName, Resource: "iamidentitymappings"}, iamidentity)
-	f.actions = append(f.actions, action)
-}
-
 func (f *fixture) expectUpdateStatusAction(iamidentity *iamauthenticatorv1alpha1.IAMIdentityMapping) {
 	action := core.NewRootUpdateSubresourceAction(schema.GroupVersionResource{Group: iamauthenticator.GroupName, Resource: "iamidentitymappings"}, "status", iamidentity)
-	f.actions = append(f.actions, action)
-}
-
-func (f *fixture) expectCreateAction(iamidentity *iamauthenticatorv1alpha1.IAMIdentityMapping) {
-	action := core.NewRootCreateAction(schema.GroupVersionResource{Group: iamauthenticator.GroupName, Resource: "iamidentitymappings"}, iamidentity)
 	f.actions = append(f.actions, action)
 }
 

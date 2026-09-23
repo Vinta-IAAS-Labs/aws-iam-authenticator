@@ -1,3 +1,5 @@
+//go:build !no_token
+
 /*
 Copyright 2017 by the contributors.
 
@@ -17,6 +19,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 
@@ -30,7 +33,7 @@ var tokenCmd = &cobra.Command{
 	Use:   "token",
 	Short: "Authenticate using AWS IAM and get token for Kubernetes",
 	Long:  ``,
-	Run: func(cmd *cobra.Command, args []string) {
+	Run: func(cmd *cobra.Command, _ []string) {
 		region := viper.GetString("region")
 		roleARN := viper.GetString("role")
 		externalID := viper.GetString("externalID")
@@ -42,13 +45,17 @@ var tokenCmd = &cobra.Command{
 
 		if clusterID == "" {
 			fmt.Fprintf(os.Stderr, "Error: cluster ID not specified\n")
-			cmd.Usage()
+			if err := cmd.Usage(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error displaying usage: %v\n", err)
+			}
 			os.Exit(1)
 		}
 
 		if forwardSessionName && sessionName != "" {
 			fmt.Fprintf(os.Stderr, "Error: cannot specify both --forward-session-name and --session-name parameter\n")
-			cmd.Usage()
+			if err := cmd.Usage(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error displaying usage: %v\n", err)
+			}
 			os.Exit(1)
 		}
 
@@ -61,7 +68,7 @@ var tokenCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		tok, err = gen.GetWithOptions(&token.GetTokenOptions{
+		tok, err = gen.GetWithOptions(context.Background(), &token.GetTokenOptions{
 			ClusterID:            clusterID,
 			AssumeRoleARN:        roleARN,
 			AssumeRoleExternalID: externalID,
@@ -92,12 +99,36 @@ func init() {
 		false,
 		"Enable mapping a federated sessions caller-specified-role-name attribute onto newly assumed sessions. NOTE: Only applicable when a new role is requested via --role")
 	tokenCmd.Flags().Bool("cache", false, "Cache the credential on disk until it expires. Uses the aws profile specified by AWS_PROFILE or the default profile.")
-	viper.BindPFlag("region", tokenCmd.Flags().Lookup("region"))
-	viper.BindPFlag("role", tokenCmd.Flags().Lookup("role"))
-	viper.BindPFlag("externalID", tokenCmd.Flags().Lookup("external-id"))
-	viper.BindPFlag("tokenOnly", tokenCmd.Flags().Lookup("token-only"))
-	viper.BindPFlag("forwardSessionName", tokenCmd.Flags().Lookup("forward-session-name"))
-	viper.BindPFlag("sessionName", tokenCmd.Flags().Lookup("session-name"))
-	viper.BindPFlag("cache", tokenCmd.Flags().Lookup("cache"))
-	viper.BindEnv("role", "DEFAULT_ROLE")
+	if err := viper.BindPFlag("region", tokenCmd.Flags().Lookup("region")); err != nil {
+		fmt.Printf("Failed to bind flag '%s' - %+v\n", "region", err)
+		os.Exit(1)
+	}
+	if err := viper.BindPFlag("role", tokenCmd.Flags().Lookup("role")); err != nil {
+		fmt.Printf("Failed to bind flag '%s' - %+v\n", "role", err)
+		os.Exit(1)
+	}
+	if err := viper.BindPFlag("externalID", tokenCmd.Flags().Lookup("external-id")); err != nil {
+		fmt.Printf("Failed to bind flag '%s' - %+v\n", "externalID", err)
+		os.Exit(1)
+	}
+	if err := viper.BindPFlag("tokenOnly", tokenCmd.Flags().Lookup("token-only")); err != nil {
+		fmt.Printf("Failed to bind flag '%s' - %+v\n", "tokenOnly", err)
+		os.Exit(1)
+	}
+	if err := viper.BindPFlag("forwardSessionName", tokenCmd.Flags().Lookup("forward-session-name")); err != nil {
+		fmt.Printf("Failed to bind flag '%s' - %+v\n", "forwardSessionName", err)
+		os.Exit(1)
+	}
+	if err := viper.BindPFlag("sessionName", tokenCmd.Flags().Lookup("session-name")); err != nil {
+		fmt.Printf("Failed to bind flag '%s' - %+v\n", "sessionName", err)
+		os.Exit(1)
+	}
+	if err := viper.BindPFlag("cache", tokenCmd.Flags().Lookup("cache")); err != nil {
+		fmt.Printf("Failed to bind flag '%s' - %+v\n", "cache", err)
+		os.Exit(1)
+	}
+	if err := viper.BindEnv("role", "DEFAULT_ROLE"); err != nil {
+		fmt.Printf("Failed to bind env '%s' - %+v\n", "role", err)
+		os.Exit(1)
+	}
 }

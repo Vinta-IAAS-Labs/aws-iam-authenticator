@@ -1,3 +1,5 @@
+//go:build !no_init
+
 /*
 Copyright 2017 by the contributors.
 
@@ -32,7 +34,7 @@ var initCmd = &cobra.Command{
 	Use:   "init",
 	Short: "Pre-generate certificate, private key, and kubeconfig files for the server.",
 	Long:  ``,
-	Run: func(cmd *cobra.Command, args []string) {
+	Run: func(_ *cobra.Command, _ []string) {
 		fmt.Printf("Authenticator Version: %q, %q\n", pkg.Version, pkg.CommitID)
 		cfg, err := getConfig()
 		if err != nil {
@@ -75,13 +77,19 @@ func init() {
 		"hostname",
 		"localhost",
 		"Hostname that should be used for writing the self-signed certificates")
-	viper.BindPFlag("server.hostname", initCmd.Flags().Lookup("hostname"))
+	if err := viper.BindPFlag("server.hostname", initCmd.Flags().Lookup("hostname")); err != nil {
+		fmt.Printf("Failed to bind flag '%s' - %+v\n", "server.hostname", err)
+		os.Exit(1)
+	}
 
 	initCmd.Flags().String(
 		"address",
 		"127.0.0.1",
 		"IP Address to bind the server to listen to. (should be a 127.0.0.1 or 0.0.0.0)")
-	viper.BindPFlag("server.address", initCmd.Flags().Lookup("address"))
+	if err := viper.BindPFlag("server.address", initCmd.Flags().Lookup("address")); err != nil {
+		fmt.Printf("Failed to bind env '%s' - %+v\n", "server.address", err)
+		os.Exit(1)
+	}
 
 	rootCmd.AddCommand(initCmd)
 }

@@ -46,6 +46,7 @@ NETWORK_NAME="${NETWORK_NAME:-authenticator-dev}"
 NETWORK_SUBNET="${NETWORK_SUBNET:-172.30.0.0/16}"
 AUTHENTICATOR_IP="${AUTHENTICATOR_IP:-172.30.0.10}"
 AUTHENTICATOR_PORT="${AUTHENTICATOR_PORT:-21362}"
+KIND_BIN="${KIND_BIN:-${OUTPUT}/bin/kind}"
 
 # Not configurable:
 authenticator_healthz_port=21363
@@ -66,6 +67,7 @@ authenticator_dynamicfile_host_path="${OUTPUT}/dev/authenticator/access-entry"
 authenticator_access_entry_host_file="${authenticator_dynamicfile_host_path}/access-entries.json"
 authenticator_dynamicfile_dest_path="/var/authenticator/access-entry"
 authenticator_access_entry_dest_file="${authenticator_dynamicfile_dest_path}/access-entries.json"
+authenticator_backend_mode_dest_file="${authenticator_dynamicfile_dest_path}/backend-modes.json"
 authenticator_config_dest_dir="/etc/authenticator"
 authenticator_export_dest_dir="/var/authenticator/export"
 authenticator_state_dest_dir="/var/authenticator/state"
@@ -85,16 +87,19 @@ kubectl_kubeconfig="${client_dir}/kubeconfig.yaml"
 kind_kubeconfig="${client_dir}/kind-kubeconfig.yaml"
 
 function install_kind() {
-  if [[ "$OSTYPE" == "darwin"* ]]; then
-      # for Intel Macs
-      [ $(uname -m) = x86_64 ]&& curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.17.0/kind-darwin-amd64
-      # for M1 / ARM Macs
-      [ $(uname -m) = arm64 ] && curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.17.0/kind-darwin-arm64
-  else
-      curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.17.0/kind-linux-amd64
-  fi
-  chmod +x ./kind
-  command -v ./kind >/dev/null 2>&1 || { echo >&2 "kind is required but it's not installed.  Aborting."; exit 1; }
+    if ! [[ -f "${KIND_BIN}" ]]; then
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            # for Intel Macs
+            [ $(uname -m) = x86_64 ]&& curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.17.0/kind-darwin-amd64
+            # for M1 / ARM Macs
+            [ $(uname -m) = arm64 ] && curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.17.0/kind-darwin-arm64
+        else
+            curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.17.0/kind-linux-amd64
+        fi
+        chmod +x ./kind
+        mv ./kind "${KIND_BIN}"
+    fi
+    command -v "${KIND_BIN}" >/dev/null 2>&1 || { echo >&2 "kind is required but it's not installed.  Aborting."; exit 1; }
 }
 
 function create_network() {
@@ -141,6 +146,7 @@ function write_authenticator_with_dynamicfile_mode_config() {
         -e "s|{{AUTHENTICATOR_IP}}|${AUTHENTICATOR_IP}|g" \
         -e "s|{{CLUSTER_NAME}}|${CLUSTER_NAME}|g" \
         -e "s|{{AUTHENTICATOR_DYNAMICFILE_PATH}}|${authenticator_access_entry_dest_file}|g" \
+        -e "s|{{BACKENDMODE_PATH}}|${authenticator_backend_mode_dest_file}|g" \
         "${authenticator_dynamicfile_mode_config_template}" > "${authenticator_dynamicfile_mode_config}"
     cat "${authenticator_dynamicfile_mode_config}"
     cp "${authenticator_access_entry_template}" "${authenticator_access_entry_host_file}"
@@ -196,7 +202,6 @@ function start_authenticator_with_dynamicfile() {
         --publish ${authenticator_healthz_port}:${authenticator_healthz_port} \
         --publish ${AUTHENTICATOR_PORT}:${AUTHENTICATOR_PORT} \
         --env AWS_REGION="us-west-2" \
-        --rm \
         "${AUTHENTICATOR_IMAGE}" \
         server \
         --config "${authenticator_config_dest_dir}/authenticator_dynamicfile_mode.yaml"
@@ -234,11 +239,11 @@ function write_kubectl_kubeconfig() {
 
 function create_kind_cluster() {
     export KIND_EXPERIMENTAL_DOCKER_NETWORK="${NETWORK_NAME}"
-    ./kind create cluster \
+    "${KIND_BIN}" create cluster \
         --config "${kind_config_host_dir}/env.yaml" \
         --kubeconfig "${kind_kubeconfig}"
 }
 
 function delete_kind_cluster() {
-    ./kind delete cluster --name "${CLUSTER_NAME}"
+    "${KIND_BIN}" delete cluster --name "${CLUSTER_NAME}"
 }

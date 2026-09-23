@@ -14,9 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Package server implements the aws-iam-authenticator webhook authentication server.
 package server
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -26,8 +28,12 @@ import (
 	"strings"
 	"time"
 
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 	"sigs.k8s.io/aws-iam-authenticator/pkg/config"
 	"sigs.k8s.io/aws-iam-authenticator/pkg/ec2provider"
+	"sigs.k8s.io/aws-iam-authenticator/pkg/errutil"
+	"sigs.k8s.io/aws-iam-authenticator/pkg/fileutil"
 	"sigs.k8s.io/aws-iam-authenticator/pkg/mapper"
 	"sigs.k8s.io/aws-iam-authenticator/pkg/mapper/configmap"
 	"sigs.k8s.io/aws-iam-authenticator/pkg/mapper/crd"
@@ -36,7 +42,7 @@ import (
 	"sigs.k8s.io/aws-iam-authenticator/pkg/metrics"
 	"sigs.k8s.io/aws-iam-authenticator/pkg/token"
 
-	awsarn "github.com/aws/aws-sdk-go/aws/arn"
+	awsarn "github.com/aws/aws-sdk-go-v2/aws/arn"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
 	authenticationv1beta1 "k8s.io/api/authentication/v1beta1"
@@ -58,35 +64,30 @@ var tokenReviewDenyJSON = func() []byte {
 
 // Pattern to match EC2 instance IDs
 var (
-	instanceIDPattern = regexp.MustCompile("^i-(\\w{8}|\\w{17})$")
+	instanceIDPattern = regexp.MustCompile(`^i-(\w{8}|\w{17})$`)
 )
 
 // server state (internal)
 type handler struct {
 	http.ServeMux
-	verifier         token.Verifier
-	ec2Provider      ec2provider.EC2Provider
-	clusterID        string
-	mappers          []mapper.Mapper
-	scrubbedAccounts []string
+	verifier                  token.Verifier
+	ec2Provider               ec2provider.EC2Provider
+	clusterID                 string
+	backendMapper             BackendMapper
+	backendModeConfigInitDone bool
+	scrubbedAccounts          []string
+	cfg                       config.Config
 }
 
 // New authentication webhook server.
-func New(cfg config.Config, stopCh <-chan struct{}) *Server {
+func New(ctx context.Context, cfg config.Config) *Server {
 	c := &Server{
 		Config: cfg,
 	}
 
-	mappers, err := BuildMapperChain(cfg)
+	backendMapper, err := BuildMapperChain(cfg, cfg.BackendMode)
 	if err != nil {
 		logrus.Fatalf("failed to build mapper chain: %v", err)
-	}
-
-	for _, m := range mappers {
-		logrus.Infof("starting mapper %q", m.Name())
-		if err := m.Start(stopCh); err != nil {
-			logrus.Fatalf("start mapper %q failed", m.Name())
-		}
 	}
 
 	for _, mapping := range c.RoleMappings {
@@ -131,6 +132,7 @@ func New(cfg config.Config, stopCh <-chan struct{}) *Server {
 	listener, err := tls.Listen("tcp", c.ListenAddr(), &tls.Config{
 		MinVersion:   tls.VersionTLS12,
 		Certificates: []tls.Certificate{*cert},
+		NextProtos:   []string{"h2", "http/1.1"},
 	})
 	if err != nil {
 		logrus.WithError(err).Fatal("could not open TLS listener")
@@ -138,100 +140,185 @@ func New(cfg config.Config, stopCh <-chan struct{}) *Server {
 
 	// create a logrus logger for HTTP error logs
 	errLog := logrus.WithField("http", "error").Writer()
-	defer errLog.Close()
+	defer func() {
+		if err := errLog.Close(); err != nil {
+			logrus.WithError(err).Warn("error closing error log writer")
+		}
+	}()
 
 	logrus.Infof("listening on %s", listener.Addr())
 	logrus.Infof("reconfigure your apiserver with `--authentication-token-webhook-config-file=%s` to enable (assuming default hostPath mounts)", c.GenerateKubeconfigPath)
+	internalHandler := c.getHandler(ctx, backendMapper, c.EC2DescribeInstancesQps, c.EC2DescribeInstancesBurst)
 	c.httpServer = http.Server{
-		ErrorLog: log.New(errLog, "", 0),
-		Handler:  c.getHandler(mappers, c.EC2DescribeInstancesQps, c.EC2DescribeInstancesBurst),
+		ErrorLog:          log.New(errLog, "", 0),
+		Handler:           internalHandler,
+		ReadHeaderTimeout: 60 * time.Second,
 	}
 	c.listener = listener
+	c.internalHandler = internalHandler
 	return c
 }
 
 // Run will run the server closing the connection if there is a struct on the channel
 func (c *Server) Run(stopCh <-chan struct{}) {
 
-	defer c.listener.Close()
+	defer func() {
+		if err := c.listener.Close(); err != nil {
+			logrus.WithError(err).Warn("error closing listener")
+		}
+	}()
 
 	go func() {
-		http.ListenAndServe(":21363", &healthzHandler{})
+		healthPort := c.HealthPort
+		if healthPort == 0 {
+			healthPort = 21363
+		}
+		healthzServer := &http.Server{
+			Addr:              fmt.Sprintf(":%d", healthPort),
+			Handler:           &healthzHandler{},
+			ReadHeaderTimeout: 60 * time.Second,
+		}
+		if err := healthzServer.ListenAndServe(); err != nil {
+			logrus.WithError(err).Error("healthz server exited")
+		}
+	}()
+	go func() {
+		for range stopCh {
+			logrus.Info("shut down mapper before return from Run")
+			close(c.internalHandler.backendMapper.mapperStopCh)
+			return
+		}
 	}()
 	if err := c.httpServer.Serve(c.listener); err != nil {
-		logrus.WithError(err).Fatal("http server exited")
+		logrus.WithError(err).Warning("http server exited")
+	}
+}
+
+// Close shuts down the authenticator server.
+func (c *Server) Close() {
+	if err := c.listener.Close(); err != nil {
+		logrus.WithError(err).Error("could not close listener")
+	}
+
+	ctxTimeout, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
+
+	if err := c.httpServer.Shutdown(ctxTimeout); err != nil {
+		logrus.WithError(err).Error("could not gracefully shutdown http server")
 	}
 }
 
 type healthzHandler struct{}
 
-func (m *healthzHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "ok")
+func (m *healthzHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	if _, err := fmt.Fprintf(w, "ok"); err != nil {
+		logrus.WithError(err).Error("could not write response")
+	}
 }
-func (c *Server) getHandler(mappers []mapper.Mapper, ec2DescribeQps int, ec2DescribeBurst int) *handler {
+func (c *Server) getHandler(ctx context.Context, backendMapper BackendMapper, ec2DescribeQPS int, ec2DescribeBurst int) *handler {
+	stopCh := ctx.Done()
 	if c.ServerEC2DescribeInstancesRoleARN != "" {
 		_, err := awsarn.Parse(c.ServerEC2DescribeInstancesRoleARN)
 		if err != nil {
 			panic(fmt.Sprintf("describeinstancesrole %s is not a valid arn", c.ServerEC2DescribeInstancesRoleARN))
 		}
 	}
-
-	h := &handler{
-		verifier:         token.NewVerifier(c.ClusterID, c.PartitionID),
-		ec2Provider:      ec2provider.New(c.ServerEC2DescribeInstancesRoleARN, ec2DescribeQps, ec2DescribeBurst),
-		clusterID:        c.ClusterID,
-		mappers:          mappers,
-		scrubbedAccounts: c.Config.ScrubbedAWSAccounts,
+	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	if err != nil {
+		panic(fmt.Sprintf("could not load config, %v", err))
+	}
+	// Attempt to get the region from IMDS (applicable if run on an EC2 instance)
+	imdsClient := imds.NewFromConfig(cfg)
+	instanceRegionOutput, err := imdsClient.GetRegion(ctx, &imds.GetRegionInput{})
+	instanceRegion := ""
+	if err != nil {
+		// Default to the global region
+		logrus.Infof("failed to get region from IMDS for handler configuration, defaulting to us-east-1. imds error: %v", err)
+		cfg.Region = "us-east-1"
+	} else {
+		instanceRegion = instanceRegionOutput.Region
 	}
 
-	h.HandleFunc("/authenticate", h.authenticateEndpoint)
+	h := &handler{
+		verifier:                  token.NewVerifier(c.ClusterID, c.PartitionID, instanceRegion),
+		ec2Provider:               ec2provider.New(ctx, c.ServerEC2DescribeInstancesRoleARN, c.SourceARN, instanceRegion, ec2DescribeQPS, ec2DescribeBurst),
+		clusterID:                 c.ClusterID,
+		backendMapper:             backendMapper,
+		scrubbedAccounts:          c.ScrubbedAWSAccounts,
+		cfg:                       c.Config,
+		backendModeConfigInitDone: false,
+	}
+
+	h.HandleFunc("/authenticate", func(w http.ResponseWriter, r *http.Request) {
+		h.authenticateEndpoint(ctx, w, r)
+	})
 	h.Handle("/metrics", promhttp.Handler())
-	h.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "ok")
+	h.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		if _, err := fmt.Fprintf(w, "ok"); err != nil {
+			logrus.WithError(err).Error("could not write response")
+		}
 	})
 	logrus.Infof("Starting the h.ec2Provider.startEc2DescribeBatchProcessing ")
-	go h.ec2Provider.StartEc2DescribeBatchProcessing()
+	go h.ec2Provider.StartEc2DescribeBatchProcessing(ctx)
+	if strings.TrimSpace(c.DynamicBackendModePath) != "" {
+		fileutil.StartLoadDynamicFile(c.DynamicBackendModePath, h, stopCh)
+	}
+
 	return h
 }
 
-func BuildMapperChain(cfg config.Config) ([]mapper.Mapper, error) {
-	modes := cfg.BackendMode
-	mappers := []mapper.Mapper{}
+// BuildMapperChain constructs the chain of identity mappers from the given config and mode list.
+func BuildMapperChain(cfg config.Config, modes []string) (BackendMapper, error) {
+	backendMapper := BackendMapper{
+		mappers:      []mapper.Mapper{},
+		mapperStopCh: make(chan struct{}),
+	}
 	for _, mode := range modes {
 		switch mode {
-		case mapper.ModeFile:
+		case mapper.ModeFile: //nolint:staticcheck // SA1019: ModeFile is deprecated but accepted for backwards compatibility
 			fallthrough
 		case mapper.ModeMountedFile:
 			fileMapper, err := file.NewFileMapper(cfg)
 			if err != nil {
-				return nil, fmt.Errorf("backend-mode %q creation failed: %v", mode, err)
+				return BackendMapper{}, fmt.Errorf("backend-mode %q creation failed: %v", mode, err)
 			}
-			mappers = append(mappers, fileMapper)
-		case mapper.ModeConfigMap:
+			backendMapper.mappers = append(backendMapper.mappers, fileMapper)
+		case mapper.ModeConfigMap: //nolint:staticcheck // SA1019: ModeConfigMap is deprecated but accepted for backwards compatibility
 			fallthrough
 		case mapper.ModeEKSConfigMap:
 			configMapMapper, err := configmap.NewConfigMapMapper(cfg)
 			if err != nil {
-				return nil, fmt.Errorf("backend-mode %q creation failed: %v", mode, err)
+				return BackendMapper{}, fmt.Errorf("backend-mode %q creation failed: %v", mode, err)
 			}
-			mappers = append(mappers, configMapMapper)
+			backendMapper.mappers = append(backendMapper.mappers, configMapMapper)
 		case mapper.ModeCRD:
 			crdMapper, err := crd.NewCRDMapper(cfg)
 			if err != nil {
-				return nil, fmt.Errorf("backend-mode %q creation failed: %v", mode, err)
+				return BackendMapper{}, fmt.Errorf("backend-mode %q creation failed: %v", mode, err)
 			}
-			mappers = append(mappers, crdMapper)
+			backendMapper.mappers = append(backendMapper.mappers, crdMapper)
 		case mapper.ModeDynamicFile:
 			dynamicFileMapper, err := dynamicfile.NewDynamicFileMapper(cfg)
 			if err != nil {
-				return nil, fmt.Errorf("backend-mode %q creation failed: %v", mode, err)
+				return BackendMapper{}, fmt.Errorf("backend-mode %q creation failed: %v", mode, err)
 			}
-			mappers = append(mappers, dynamicFileMapper)
+			backendMapper.mappers = append(backendMapper.mappers, dynamicFileMapper)
 		default:
-			return nil, fmt.Errorf("backend-mode %q is not a valid mode", mode)
+			return BackendMapper{}, fmt.Errorf("backend-mode %q is not a valid mode", mode)
 		}
 	}
-	return mappers, nil
+	for _, m := range backendMapper.mappers {
+		logrus.Infof("starting mapper %q", m.Name())
+		if err := m.Start(backendMapper.mapperStopCh); err != nil {
+			logrus.Fatalf("start mapper %q failed", m.Name())
+		}
+		if backendMapper.currentModes != "" {
+			backendMapper.currentModes = backendMapper.currentModes + " " + m.Name()
+		} else {
+			backendMapper.currentModes = m.Name()
+		}
+	}
+	return backendMapper, nil
 }
 
 func duration(start time.Time) float64 {
@@ -247,7 +334,7 @@ func (h *handler) isLoggableIdentity(identity *token.Identity) bool {
 	return true
 }
 
-func (h *handler) authenticateEndpoint(w http.ResponseWriter, req *http.Request) {
+func (h *handler) authenticateEndpoint(ctx context.Context, w http.ResponseWriter, req *http.Request) {
 	start := time.Now()
 	log := logrus.WithFields(logrus.Fields{
 		"path":   req.URL.Path,
@@ -267,7 +354,11 @@ func (h *handler) authenticateEndpoint(w http.ResponseWriter, req *http.Request)
 		metrics.Get().Latency.WithLabelValues(metrics.Malformed).Observe(duration(start))
 		return
 	}
-	defer req.Body.Close()
+	defer func() {
+		if err := req.Body.Close(); err != nil {
+			log.WithError(err).Warn("error closing request body")
+		}
+	}()
 
 	var tokenReview authenticationv1beta1.TokenReview
 	if err := json.NewDecoder(req.Body).Decode(&tokenReview); err != nil {
@@ -285,14 +376,24 @@ func (h *handler) authenticateEndpoint(w http.ResponseWriter, req *http.Request)
 	// if the token is invalid, reject with a 403
 	identity, err := h.verifier.Verify(tokenReview.Spec.Token)
 	if err != nil {
-		if _, ok := err.(token.STSError); ok {
+		if _, ok := err.(token.STSThrottling); ok {
+			metrics.Get().Latency.WithLabelValues(metrics.STSThrottling).Observe(duration(start))
+			log.WithError(err).Warn("access denied")
+			w.WriteHeader(http.StatusTooManyRequests)
+			if _, err := w.Write(tokenReviewDenyJSON); err != nil {
+				log.WithError(err).Error("could not write response")
+			}
+			return
+		} else if _, ok := err.(token.STSError); ok {
 			metrics.Get().Latency.WithLabelValues(metrics.STSError).Observe(duration(start))
 		} else {
 			metrics.Get().Latency.WithLabelValues(metrics.Invalid).Observe(duration(start))
 		}
 		log.WithError(err).Warn("access denied")
 		w.WriteHeader(http.StatusForbidden)
-		w.Write(tokenReviewDenyJSON)
+		if _, err := w.Write(tokenReviewDenyJSON); err != nil {
+			log.WithError(err).Error("could not write response")
+		}
 		return
 	}
 
@@ -303,18 +404,21 @@ func (h *handler) authenticateEndpoint(w http.ResponseWriter, req *http.Request)
 			"accountid":   identity.AccountID,
 			"userid":      identity.UserID,
 			"session":     identity.SessionName,
+			"stsendpoint": identity.STSEndpoint,
 		}).Info("STS response")
 
 		// look up the ARN in each of our mappings to fill in the username and groups
 		log = log.WithField("arn", identity.CanonicalARN)
 	}
 
-	username, groups, err := h.doMapping(identity)
+	username, groups, err := h.doMapping(ctx, identity)
 	if err != nil {
 		metrics.Get().Latency.WithLabelValues(metrics.Unknown).Observe(duration(start))
 		log.WithError(err).Warn("access denied")
 		w.WriteHeader(http.StatusForbidden)
-		w.Write(tokenReviewDenyJSON)
+		if _, err := w.Write(tokenReviewDenyJSON); err != nil {
+			log.WithError(err).Error("could not write response")
+		}
 		return
 	}
 
@@ -326,9 +430,10 @@ func (h *handler) authenticateEndpoint(w http.ResponseWriter, req *http.Request)
 
 	// the token is valid and the role is mapped, return success!
 	log.WithFields(logrus.Fields{
-		"username": username,
-		"uid":      uid,
-		"groups":   groups,
+		"username":    username,
+		"uid":         uid,
+		"groups":      groups,
+		"stsendpoint": identity.STSEndpoint,
 	}).Info("access granted")
 	metrics.Get().Latency.WithLabelValues(metrics.Success).Observe(duration(start))
 	w.WriteHeader(http.StatusOK)
@@ -339,9 +444,11 @@ func (h *handler) authenticateEndpoint(w http.ResponseWriter, req *http.Request)
 		userExtra["canonicalArn"] = authenticationv1beta1.ExtraValue{identity.CanonicalARN}
 		userExtra["sessionName"] = authenticationv1beta1.ExtraValue{identity.SessionName}
 		userExtra["accessKeyId"] = authenticationv1beta1.ExtraValue{identity.AccessKeyID}
+		userExtra["principalId"] = authenticationv1beta1.ExtraValue{identity.UserID}
+		userExtra["sigs.k8s.io/aws-iam-authenticator/principalId"] = authenticationv1beta1.ExtraValue{identity.UserID}
 	}
 
-	json.NewEncoder(w).Encode(authenticationv1beta1.TokenReview{
+	if err := json.NewEncoder(w).Encode(authenticationv1beta1.TokenReview{
 		Status: authenticationv1beta1.TokenReviewStatus{
 			Authenticated: true,
 			User: authenticationv1beta1.UserInfo{
@@ -351,53 +458,65 @@ func (h *handler) authenticateEndpoint(w http.ResponseWriter, req *http.Request)
 				Extra:    userExtra,
 			},
 		},
-	})
+	}); err != nil {
+		log.WithError(err).Error("could not serialize response")
+	}
 }
 
-func (h *handler) doMapping(identity *token.Identity) (string, []string, error) {
+// ReservedPrefixExists reports whether any reserved prefix matches the given username.
+func ReservedPrefixExists(username string, reservedList []string) bool {
+	for _, prefix := range reservedList {
+		if len(prefix) > 0 && strings.HasPrefix(username, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *handler) doMapping(ctx context.Context, identity *token.Identity) (string, []string, error) {
 	var errs []error
 
-	canonicalARN := strings.ToLower(identity.CanonicalARN)
-
-	for _, m := range h.mappers {
-		mapping, err := m.Map(canonicalARN)
+	for _, m := range h.backendMapper.mappers {
+		mapping, err := m.Map(identity)
 		if err == nil {
 			// Mapping found, try to render any templates like {{EC2PrivateDNSName}}
-			username, groups, err := h.renderTemplates(*mapping, identity)
+			username, groups, err := h.renderTemplates(ctx, *mapping, identity)
 			if err != nil {
 				return "", nil, fmt.Errorf("mapper %s renderTemplates error: %v", m.Name(), err)
 			}
+			if len(m.UsernamePrefixReserveList()) > 0 && ReservedPrefixExists(username, m.UsernamePrefixReserveList()) {
+				return "", nil, fmt.Errorf("invalid username '%s' for mapper %s: username must not begin with with the following prefixes: %v", username, m.Name(), m.UsernamePrefixReserveList())
+			}
 			return username, groups, nil
-		} else {
-			if err != mapper.ErrNotMapped {
-				errs = append(errs, fmt.Errorf("mapper %s Map error: %v", m.Name(), err))
-			}
+		}
+		if err != errutil.ErrNotMapped {
+			errs = append(errs, fmt.Errorf("mapper %s Map error: %v", m.Name(), err))
+		}
 
-			if m.IsAccountAllowed(identity.AccountID) {
-				return identity.CanonicalARN, []string{}, nil
-			}
+		if m.IsAccountAllowed(identity.AccountID) {
+			return identity.CanonicalARN, []string{}, nil
 		}
 	}
 
 	if len(errs) > 0 {
 		return "", nil, utilerrors.NewAggregate(errs)
 	}
-	return "", nil, mapper.ErrNotMapped
+	return "", nil, errutil.ErrNotMapped
 }
 
-func (h *handler) renderTemplates(mapping config.IdentityMapping, identity *token.Identity) (string, []string, error) {
+func (h *handler) renderTemplates(ctx context.Context, mapping config.IdentityMapping, identity *token.Identity) (string, []string, error) {
 	var username string
 	groups := []string{}
 	var err error
 
 	userPattern := mapping.Username
-	username, err = h.renderTemplate(userPattern, identity)
+	username, err = h.renderTemplate(ctx, userPattern, identity)
 	if err != nil {
 		return "", nil, fmt.Errorf("error rendering username template %q: %s", userPattern, err.Error())
 	}
 
 	for _, groupPattern := range mapping.Groups {
-		group, err := h.renderTemplate(groupPattern, identity)
+		group, err := h.renderTemplate(ctx, groupPattern, identity)
 		if err != nil {
 			return "", nil, fmt.Errorf("error rendering group template %q: %s", groupPattern, err.Error())
 		}
@@ -407,24 +526,87 @@ func (h *handler) renderTemplates(mapping config.IdentityMapping, identity *toke
 	return username, groups, nil
 }
 
-func (h *handler) renderTemplate(template string, identity *token.Identity) (string, error) {
+func (h *handler) renderTemplate(ctx context.Context, template string, identity *token.Identity) (string, error) {
 	// Private DNS requires EC2 API call
 	if strings.Contains(template, "{{EC2PrivateDNSName}}") {
 		if !instanceIDPattern.MatchString(identity.SessionName) {
 			return "", fmt.Errorf("SessionName did not contain an instance id")
 		}
-		privateDNSName, err := h.ec2Provider.GetPrivateDNSName(identity.SessionName)
+		privateDNSName, err := h.ec2Provider.GetPrivateDNSName(ctx, identity.SessionName)
 		if err != nil {
 			return "", err
 		}
-		template = strings.Replace(template, "{{EC2PrivateDNSName}}", privateDNSName, -1)
+		template = strings.ReplaceAll(template, "{{EC2PrivateDNSName}}", privateDNSName)
 	}
 
-	template = strings.Replace(template, "{{AccountID}}", identity.AccountID, -1)
-	sessionName := strings.Replace(identity.SessionName, "@", "-", -1)
-	template = strings.Replace(template, "{{SessionName}}", sessionName, -1)
-	template = strings.Replace(template, "{{SessionNameRaw}}", identity.SessionName, -1)
-	template = strings.Replace(template, "{{AccessKeyID}}", identity.AccessKeyID, -1)
+	template = strings.ReplaceAll(template, "{{AccountID}}", identity.AccountID)
+	sessionName := strings.ReplaceAll(identity.SessionName, "@", "-")
+	template = strings.ReplaceAll(template, "{{SessionName}}", sessionName)
+	template = strings.ReplaceAll(template, "{{SessionNameRaw}}", identity.SessionName)
+	template = strings.ReplaceAll(template, "{{AccessKeyID}}", identity.AccessKeyID)
 
 	return template, nil
+}
+
+func (h *handler) CallBackForFileLoad(dynamicContent []byte) error {
+	var backendModes BackendModeConfig
+	logrus.Infof("BackendMode dynamic file got changed to %s", string(dynamicContent))
+	err := json.Unmarshal(dynamicContent, &backendModes)
+	if err != nil {
+		logrus.Infof("CallBackForFileLoad: could not unmarshal dynamic file.")
+		return err
+	}
+	if h.backendMapper.currentModes != backendModes.BackendMode {
+		logrus.Infof("BackendMode dynamic file got changed, %s different from current mode %s, rebuild mapper", backendModes.BackendMode, h.backendMapper.currentModes)
+		newMapper, err := BuildMapperChain(h.cfg, strings.Split(backendModes.BackendMode, " "))
+		if err == nil && len(newMapper.mappers) > 0 {
+			// replace the mapper
+			close(h.backendMapper.mapperStopCh)
+			h.backendMapper = newMapper
+		} else {
+			return err
+		}
+	} else {
+		logrus.Infof("BackendMode dynamic file got changed, but same with current mode, skip rebuild mapper")
+	}
+
+	// when instance or container restarts, the backendend mode config is (re)loaded and the latency metric is calculated
+	// regardless if there was a change upstream, and thus can emit an incorrect latency value
+	// so a workaround is to skip the first time the metric is calculated, and only emit metris after
+	// as we know any subsequent calculations are from a valid change upstream
+	if h.backendModeConfigInitDone {
+		latency, err := fileutil.CalculateTimeDeltaFromUnixInSeconds(backendModes.LastUpdatedDateTime)
+		if err != nil {
+			logrus.Errorf("error parsing latency for dynamic backend mode file: %v", err)
+		} else {
+			metrics.Get().E2ELatency.WithLabelValues("dynamic_backend_mode").Observe(float64(latency))
+			logrus.WithFields(logrus.Fields{
+				"Version": backendModes.Version,
+				"Type":    "dynamic_backend_mode",
+				"Latency": latency,
+			}).Infof("logging latency metric")
+		}
+	}
+	h.backendModeConfigInitDone = true
+
+	if h.backendMapper.currentModes == mapper.ModeDynamicFile {
+		metrics.Get().DynamicFileOnly.Set(1)
+	} else if strings.Contains(h.backendMapper.currentModes, mapper.ModeDynamicFile) {
+		metrics.Get().DynamicFileEnabled.Set(1)
+	}
+
+	return nil
+}
+
+func (h *handler) CallBackForFileDeletion() error {
+	logrus.Infof("BackendMode dynamic file got deleted")
+	backendMapper, err := BuildMapperChain(h.cfg, h.cfg.BackendMode)
+	if err == nil && len(backendMapper.mappers) > 0 {
+		// replace the mapper
+		close(h.backendMapper.mapperStopCh)
+		h.backendMapper = backendMapper
+	} else {
+		return err
+	}
+	return nil
 }

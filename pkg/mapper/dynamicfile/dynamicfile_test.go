@@ -6,7 +6,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/prometheus/client_golang/prometheus"
 	"sigs.k8s.io/aws-iam-authenticator/pkg/config"
+	"sigs.k8s.io/aws-iam-authenticator/pkg/errutil"
+	"sigs.k8s.io/aws-iam-authenticator/pkg/fileutil"
+	"sigs.k8s.io/aws-iam-authenticator/pkg/metrics"
+	"sigs.k8s.io/aws-iam-authenticator/pkg/token"
 )
 
 var (
@@ -14,21 +20,41 @@ var (
 	testRole = config.RoleMapping{RoleARN: "arn:aws:iam::012345678912:role/computer", Username: "computer", Groups: []string{"system:nodes"}}
 )
 
-func makeStore() DynamicFileMapStore {
-	ms := DynamicFileMapStore{
-		users:       make(map[string]config.UserMapping),
-		roles:       make(map[string]config.RoleMapping),
-		awsAccounts: make(map[string]interface{}),
-		filename:    "test.txt",
+func TestMain(m *testing.M) {
+	metrics.InitMetrics(prometheus.NewRegistry())
+	m.Run()
+}
+
+func makeStore(users map[string]config.UserMapping, roles map[string]config.RoleMapping, filename string, userIDStrict bool) *DynamicFileMapStore {
+	ms := &DynamicFileMapStore{
+		users:        users,
+		roles:        roles,
+		awsAccounts:  make(map[string]interface{}),
+		filename:     filename,
+		userIDStrict: userIDStrict,
 	}
-	ms.users["arn:aws:iam::012345678912:user/matt"] = testUser
-	ms.roles["arn:aws:iam::012345678912:role/computer"] = testRole
+
 	ms.awsAccounts["123"] = nil
 	return ms
 }
 
+func makeDefaultStore() *DynamicFileMapStore {
+	users := make(map[string]config.UserMapping)
+	roles := make(map[string]config.RoleMapping)
+	users["arn:aws:iam::012345678912:user/matt"] = testUser
+	roles["UserId001"] = testRole
+	return makeStore(users, roles, "test.txt", false)
+}
+
+func makeMapper(users map[string]config.UserMapping, roles map[string]config.RoleMapping, filename string, userIDStrict bool) *DynamicFileMapper {
+	store := makeStore(users, roles, filename, userIDStrict)
+	return &DynamicFileMapper{
+		DynamicFileMapStore: store,
+	}
+}
+
 func TestUserMapping(t *testing.T) {
-	ms := makeStore()
+	ms := makeDefaultStore()
 	user, err := ms.UserMapping("arn:aws:iam::012345678912:user/matt")
 	if err != nil {
 		t.Errorf("Could not find user 'matt' in map")
@@ -38,7 +64,7 @@ func TestUserMapping(t *testing.T) {
 	}
 
 	user, err = ms.UserMapping("nic")
-	if err != UserNotFound {
+	if err != errutil.ErrNotMapped {
 		t.Errorf("UserNotFound error was not returned for user 'nic'")
 	}
 	if !reflect.DeepEqual(user, config.UserMapping{}) {
@@ -47,8 +73,8 @@ func TestUserMapping(t *testing.T) {
 }
 
 func TestRoleMapping(t *testing.T) {
-	ms := makeStore()
-	role, err := ms.RoleMapping("arn:aws:iam::012345678912:role/computer")
+	ms := makeDefaultStore()
+	role, err := ms.RoleMapping("UserId001")
 	if err != nil {
 		t.Errorf("Could not find user 'instance in map")
 	}
@@ -57,7 +83,7 @@ func TestRoleMapping(t *testing.T) {
 	}
 
 	role, err = ms.RoleMapping("borg")
-	if err != RoleNotFound {
+	if err != errutil.ErrNotMapped {
 		t.Errorf("RoleNotFound error was not returend for role 'borg'")
 	}
 	if !reflect.DeepEqual(role, config.RoleMapping{}) {
@@ -66,7 +92,7 @@ func TestRoleMapping(t *testing.T) {
 }
 
 func TestAWSAccount(t *testing.T) {
-	ms := makeStore()
+	ms := makeDefaultStore()
 	if !ms.AWSAccount("123") {
 		t.Errorf("Expected aws account '123' to be in accounts list: %v", ms.awsAccounts)
 	}
@@ -77,13 +103,17 @@ func TestAWSAccount(t *testing.T) {
 
 var origFileContent = `
 {
+  "Version": "1",
+  "LastUpdatedDateTime": "12345678",
+  "ClusterId": "000000000098",
   "mapRoles": [
     {
       "rolearn": "arn:aws:iam::000000000098:role/KubernetesAdmin",
       "username": "kubernetes-admin",
       "groups": [
         "system:masters"
-      ]
+      ],
+      "userid": "userid678"
     }
   ],
   "mapUsers": [
@@ -92,14 +122,16 @@ var origFileContent = `
       "username": "alice",
       "groups": [
         "system:masters"
-      ]
+      ],
+      "userid": "userid135"
     },
     {
       "userarn": "arn:aws:iam::000000000002:user/Alice2",
       "username": "alice2",
       "groups": [
         "system:masters"
-      ]
+      ],
+      "userid": "userid136"
     }
   ],
   "mapAccounts": [
@@ -111,13 +143,17 @@ var origFileContent = `
 
 var updatedFileContent = `
 {
+  "Version": "1",
+  "LastUpdatedDateTime": "12345678",
+  "ClusterId": "000000000098",
   "mapRoles": [
     {
       "rolearn": "arn:aws:iam::000000000098:role/KubernetesAdmin",
       "username": "kubernetes-admin",
       "groups": [
         "system:masters"
-      ]
+      ],
+      "userid": "userid12359"
     },
     {
       "rolearn": "arn:aws:iam::000000000002:role/KubernetesNode",
@@ -125,7 +161,8 @@ var updatedFileContent = `
       "groups": [
         "system:bootstrappers",
         "aws:instances"
-      ]
+      ],
+      "userid": "userid123"
     },
     {
       "rolearn": "arn:aws:iam::000000000003:role/KubernetesNode",
@@ -133,14 +170,16 @@ var updatedFileContent = `
       "groups": [
         "system:nodes",
         "system:bootstrappers"
-      ]
+      ],
+      "userid": "userid008"
     },
     {
       "rolearn": "arn:aws:iam::000000000004:role/KubernetesAdmin",
       "username": "admin:{{SessionName}}",
       "groups": [
         "system:masters"
-      ]
+      ],
+      "userid": "userid777"
     }
   ],
   "mapUsers": [
@@ -149,7 +188,8 @@ var updatedFileContent = `
       "username": "alice",
       "groups": [
         "system:masters"
-      ]
+      ],
+      "userid": "userid008"
     }
   ],
   "mapAccounts": [
@@ -159,17 +199,91 @@ var updatedFileContent = `
 }
 `
 
-func TestLoadDynamicFile(t *testing.T) {
+func TestUserIdStrict(t *testing.T) {
 	stopCh := make(chan struct{})
 	defer close(stopCh)
 
-	//When the file doesn't exist, expect mapping should be empty map
-	ms, err := NewDynamicFileMapStore("/tmp/test.txt")
+	// When the file doesn't exist, expect mapping should be empty map
+	cfg := config.Config{
+		DynamicFileUserIDStrict: true,
+		DynamicFilePath:         "/tmp/test.txt",
+	}
+	ms, err := NewDynamicFileMapStore(cfg)
+	if err != nil {
+		t.Errorf("failed to create a DynamicFileMapper")
+	}
+	data := []byte(origFileContent)
+	err = os.WriteFile("/tmp/test.txt", data, 0600) //nolint:gosec // G303: fixed path intentional in test
+	if err != nil {
+		t.Errorf("failed to create a local file /tmp/test.txt")
+	}
+	fileutil.StartLoadDynamicFile(ms.filename, ms, stopCh)
+	time.Sleep(1 * time.Second)
+	ms.mutex.RLock()
+	for key := range ms.roles {
+		if key[0:6] != "userid" {
+			t.Errorf("failed to generate key for userIDStrict")
+		}
+	}
+	ms.mutex.RUnlock()
+	// clean test files
+	defer func() {
+		if err := os.Remove("/tmp/test.txt"); err != nil {
+			t.Errorf("failed to delete a local file /tmp/test.txt")
+		}
+	}()
+}
+
+func TestWithoutUserIdStrict(t *testing.T) {
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	// When the file doesn't exist, expect mapping should be empty map
+	cfg := config.Config{
+		DynamicFileUserIDStrict: false,
+		DynamicFilePath:         "/tmp/test.txt",
+	}
+	ms, err := NewDynamicFileMapStore(cfg)
+	if err != nil {
+		t.Errorf("failed to create a DynamicFileMapper")
+	}
+	data := []byte(origFileContent)
+	err = os.WriteFile("/tmp/test.txt", data, 0600) //nolint:gosec // G303: fixed path intentional in test
+	if err != nil {
+		t.Errorf("failed to create a local file /tmp/test.txt")
+	}
+	fileutil.StartLoadDynamicFile(ms.filename, ms, stopCh)
+	time.Sleep(1 * time.Second)
+	ms.mutex.RLock()
+	for key := range ms.roles {
+		if key[0:3] != "arn" {
+			t.Errorf("failed to generate key for userIDStrict")
+		}
+	}
+	ms.mutex.RUnlock()
+	// clean test files
+	defer func() {
+		if err := os.Remove("/tmp/test.txt"); err != nil {
+			t.Errorf("failed to delete a local file /tmp/test.txt")
+		}
+	}()
+}
+
+func TestLoadDynamicFileMode(t *testing.T) {
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	// When the file doesn't exist, expect mapping should be empty map
+	cfg := config.Config{
+		DynamicFileUserIDStrict: true,
+		DynamicFilePath:         "/tmp/test.txt",
+	}
+	ms, err := NewDynamicFileMapStore(cfg)
 	if err != nil {
 		t.Errorf("failed to create a DynamicFileMapper")
 	}
 
-	ms.startLoadDynamicFile(stopCh)
+	fileutil.StartLoadDynamicFile(ms.filename, ms, stopCh)
 	time.Sleep(1 * time.Second)
 	ms.mutex.RLock()
 	if len(ms.roles) != 0 {
@@ -183,10 +297,10 @@ func TestLoadDynamicFile(t *testing.T) {
 	}
 	ms.mutex.RUnlock()
 
-	//user create the dynamic file, expect that mapping should contain item
+	// user create the dynamic file, expect that mapping should contain item
 	time.Sleep(1 * time.Second)
 	data := []byte(origFileContent)
-	err = os.WriteFile("/tmp/test.txt", data, 0600)
+	err = os.WriteFile("/tmp/test.txt", data, 0600) //nolint:gosec // G303: fixed path intentional in test
 	if err != nil {
 		t.Errorf("failed to create a local file /tmp/test.txt")
 	}
@@ -203,25 +317,30 @@ func TestLoadDynamicFile(t *testing.T) {
 		t.Fatalf("testing failed as mapping should contain item since dynamic file has content")
 	}
 	ms.mutex.RUnlock()
-	//user update the dynamic file,expect mapping should be equal to expectedMapStore
+	// user update the dynamic file, expect mapping should be equal to expectedMapStore
 	expectedData := []byte(updatedFileContent)
-	err = os.WriteFile("/tmp/expected.txt", expectedData, 0600)
+	if err = os.WriteFile("/tmp/expected.txt", expectedData, 0600); err != nil { //nolint:gosec // G303: fixed path intentional in test
+		t.Errorf("failed to create expected local file /tmp/expected.txt")
+	}
 
-	expectedMapStore, err := NewDynamicFileMapStore("/tmp/expected.txt")
+	cfg = config.Config{
+		DynamicFileUserIDStrict: true,
+		DynamicFilePath:         "/tmp/expected.txt",
+	}
+	expectedMapStore, err := NewDynamicFileMapStore(cfg)
 	if err != nil {
 		t.Errorf("failed to create expected DynamicFileMapper")
 	}
-	expectedUserMappings, expectedRoleMappings, expectedAwsAccounts, err := ParseMap(expectedMapStore.filename)
+	err = expectedMapStore.CallBackForFileLoad([]byte(updatedFileContent))
 	if err != nil {
 		t.Errorf("failed to ParseMap expected DynamicFileMapper")
 	}
-	expectedMapStore.saveMap(expectedUserMappings, expectedRoleMappings, expectedAwsAccounts)
 
 	time.Sleep(1 * time.Second)
 
-	//modify the dynamic file
+	// modify the dynamic file
 	data = []byte(updatedFileContent)
-	err = os.WriteFile("/tmp/test.txt", data, 0600)
+	err = os.WriteFile("/tmp/test.txt", data, 0600) //nolint:gosec // G303: fixed path intentional in test
 	if err != nil {
 		t.Errorf("failed to modify a local file /tmp/test.txt")
 	}
@@ -237,7 +356,7 @@ func TestLoadDynamicFile(t *testing.T) {
 		t.Fatalf("testing failed as mapping doesn't update after file modification")
 	}
 	ms.mutex.RUnlock()
-	//user delete the dynamic file, expect mapping should be empty
+	// user delete the dynamic file, expect mapping should be empty
 	err = os.Remove("/tmp/test.txt")
 	if err != nil {
 		t.Errorf("failed to delete a local file /tmp/test.txt")
@@ -254,10 +373,10 @@ func TestLoadDynamicFile(t *testing.T) {
 		t.Fatalf("testing failed as mapping doesn't update after file deletion")
 	}
 	ms.mutex.RUnlock()
-	//user add file back, expect mapping should be equal to expectedMap
+	// user add file back, expect mapping should be equal to expectedMap
 	time.Sleep(1 * time.Second)
 	data = []byte(updatedFileContent)
-	err = os.WriteFile("/tmp/test.txt", data, 0600)
+	err = os.WriteFile("/tmp/test.txt", data, 0600) //nolint:gosec // G303: fixed path intentional in test
 	if err != nil {
 		t.Errorf("failed to create a local file /tmp/test.txt")
 	}
@@ -274,52 +393,288 @@ func TestLoadDynamicFile(t *testing.T) {
 		t.Fatalf("testing failed as mapping doesn't update after file modification")
 	}
 	ms.mutex.RUnlock()
-	//clean test files
-	defer os.Remove("/tmp/test.txt")
-	defer os.Remove("/tmp/expected.txt")
-
+	// clean test files
+	defer func() {
+		if err := os.Remove("/tmp/test.txt"); err != nil {
+			t.Errorf("failed to delete a local file /tmp/test.txt")
+		}
+	}()
+	defer func() {
+		if err := os.Remove("/tmp/expected.txt"); err != nil {
+			t.Errorf("failed to delete a local file /tmp/expected.txt")
+		}
+	}()
 }
 
-func TestParseMap(t *testing.T) {
-
-	data := []byte(origFileContent)
-	err := os.WriteFile("/tmp/test.txt", data, 0600)
-	if err != nil {
-		t.Errorf("failed to create a local file /tmp/test.txt")
+func TestCallBackForFileDeletion(t *testing.T) {
+	cfg := config.Config{
+		DynamicFileUserIDStrict: true,
+		DynamicFilePath:         "/tmp/test.txt",
 	}
-	ms, err := NewDynamicFileMapStore("/tmp/test.txt")
+	ms, err := NewDynamicFileMapStore(cfg)
 	if err != nil {
 		t.Errorf("failed to create a DynamicFileMapper")
 	}
 
-	u, r, a, err := ParseMap(ms.filename)
+	err = ms.CallBackForFileDeletion()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(ms.users) != 0 {
+		t.Fatalf("unexpected userMappings %+v", ms.users)
+	}
+
+	if len(ms.roles) != 0 {
+		t.Fatalf("unexpected userMappings %+v", ms.roles)
+	}
+
+	if len(ms.awsAccounts) != 0 {
+		t.Fatalf("unexpected userMappings %+v", ms.awsAccounts)
+	}
+}
+
+func TestCallBackForFileLoad(t *testing.T) {
+
+	data := []byte(origFileContent)
+	cfg := config.Config{
+		DynamicFileUserIDStrict: true,
+		DynamicFilePath:         "/tmp/test.txt",
+	}
+	ms, err := NewDynamicFileMapStore(cfg)
+	if err != nil {
+		t.Errorf("failed to create a DynamicFileMapper")
+	}
+
+	err = ms.CallBackForFileLoad(data)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	origUserMappings := []config.UserMapping{
-		{UserARN: "arn:aws:iam::000000000000:user/Alice", Username: "alice", Groups: []string{"system:masters"}},
-		{UserARN: "arn:aws:iam::000000000002:user/Alice2", Username: "alice2", Groups: []string{"system:masters"}},
+		{UserARN: "arn:aws:iam::000000000000:user/Alice", Username: "alice", Groups: []string{"system:masters"}, UserId: "userid135"},
+		{UserARN: "arn:aws:iam::000000000002:user/Alice2", Username: "alice2", Groups: []string{"system:masters"}, UserId: "userid136"},
 	}
 	origRoleMappings := []config.RoleMapping{
 		{
 			RoleARN:  "arn:aws:iam::000000000098:role/KubernetesAdmin",
 			Username: "kubernetes-admin",
 			Groups:   []string{"system:masters"},
+			UserId:   "userid678",
 		},
 	}
 	origAccounts := []string{"012345678901", "456789012345"}
 
-	if !reflect.DeepEqual(u, origUserMappings) {
-		t.Fatalf("unexpected userMappings %+v", u)
+	if len(ms.users) != len(origUserMappings) {
+		t.Fatalf("unexpected userMappings %+v", ms.users)
 	}
-	if !reflect.DeepEqual(r, origRoleMappings) {
-		t.Fatalf("unexpected roleMappings %+v", r)
-	}
-	if !reflect.DeepEqual(a, origAccounts) {
-		t.Fatalf("unexpected accounts %+v", a)
-	}
-	//clean testing files
-	defer os.Remove("/tmp/test.txt")
 
+	for _, user := range origUserMappings {
+		if _, ok := ms.users[user.UserId]; !ok {
+			t.Fatalf("unexpected userMappings %+v", ms.users)
+		}
+	}
+
+	if len(ms.roles) != len(origRoleMappings) {
+		t.Fatalf("unexpected userMappings %+v", ms.roles)
+	}
+
+	for _, role := range origRoleMappings {
+		if _, ok := ms.roles[role.UserId]; !ok {
+			t.Fatalf("unexpected userMappings %+v", ms.roles)
+		}
+	}
+
+	if len(ms.awsAccounts) != len(origAccounts) {
+		t.Fatalf("unexpected userMappings %+v", ms.awsAccounts)
+	}
+
+	for _, account := range origAccounts {
+		if _, ok := ms.awsAccounts[account]; !ok {
+			t.Fatalf("unexpected userMappings %+v", ms.users)
+		}
+	}
+}
+
+func TestMap(t *testing.T) {
+
+	tests := []struct {
+		description       string
+		identity          *token.Identity
+		users             map[string]config.UserMapping
+		roles             map[string]config.RoleMapping
+		expectedIDMapping *config.IdentityMapping
+		expectedError     error
+	}{
+		{
+			description: "UserID strict: ARNs match for user.",
+			identity: &token.Identity{
+				ARN:          "arn:aws:iam::012345678912:user/matt",
+				CanonicalARN: "arn:aws:iam::012345678912:user/matt",
+				UserID:       "1234",
+			},
+			users: map[string]config.UserMapping{
+				"1234": {
+					UserARN:  "arn:aws:iam::012345678912:user/matt",
+					UserId:   "1234",
+					Username: "asdf",
+					Groups:   []string{"asdf"},
+				},
+			},
+			roles: map[string]config.RoleMapping{},
+			expectedIDMapping: &config.IdentityMapping{
+				IdentityARN: "arn:aws:iam::012345678912:user/matt",
+				Username:    "asdf",
+				Groups:      []string{"asdf"},
+			},
+			expectedError: nil,
+		},
+		{
+			description: "UserID strict: ARNs match for role.",
+			identity: &token.Identity{
+				ARN:          "arn:aws:sts::012345678912:assumed-role/matt/extra",
+				CanonicalARN: "arn:aws:iam::012345678912:role/matt",
+				UserID:       "1234",
+			},
+			users: map[string]config.UserMapping{},
+			roles: map[string]config.RoleMapping{
+				"1234": {
+					RoleARN:  "arn:aws:iam::012345678912:role/matt",
+					UserId:   "1234",
+					Username: "asdf",
+					Groups:   []string{"asdf"},
+				},
+			},
+			expectedIDMapping: &config.IdentityMapping{
+				IdentityARN: "arn:aws:iam::012345678912:role/matt",
+				Username:    "asdf",
+				Groups:      []string{"asdf"},
+			},
+			expectedError: nil,
+		},
+		{
+			description: "UserID strict: ARNs match for role with path.",
+			identity: &token.Identity{
+				ARN:          "arn:aws:sts::012345678912:assumed-role/matt/extra",
+				CanonicalARN: "arn:aws:iam::012345678912:role/matt",
+				UserID:       "1234",
+			},
+			users: map[string]config.UserMapping{},
+			roles: map[string]config.RoleMapping{
+				"1234": {
+					RoleARN:  "arn:aws:iam::012345678912:role/path/for/this-role/matt",
+					UserId:   "1234",
+					Username: "asdf",
+					Groups:   []string{"asdf"},
+				},
+			},
+			expectedIDMapping: &config.IdentityMapping{
+				IdentityARN: "arn:aws:iam::012345678912:role/matt",
+				Username:    "asdf",
+				Groups:      []string{"asdf"},
+			},
+			expectedError: nil,
+		},
+		{
+			description: "UserID strict: ARNs do not match but UserIDs do.",
+			identity: &token.Identity{
+				ARN:          "arn:aws:iam::012345678912:user/alice",
+				CanonicalARN: "arn:aws:iam::012345678912:user/alice",
+				UserID:       "1234",
+			},
+			users: map[string]config.UserMapping{
+				"1234": {
+					UserARN: "arn:aws:iam::012345678912:user/bob",
+					UserId:  "1234",
+				},
+			},
+			roles:             map[string]config.RoleMapping{},
+			expectedIDMapping: nil,
+			expectedError:     errutil.ErrIDAndARNMismatch,
+		},
+		{
+			description: "UserID strict: malformed RoleARN is rejected even when UserID matches.",
+			identity: &token.Identity{
+				ARN:          "arn:aws:sts::012345678912:assumed-role/RealRole/session",
+				CanonicalARN: "arn:aws:iam::012345678912:role/RealRole",
+				UserID:       "AROAAAAAAAAAAAAAAAAAA",
+			},
+			users: map[string]config.UserMapping{},
+			roles: map[string]config.RoleMapping{
+				"AROAAAAAAAAAAAAAAAAAA": {
+					RoleARN:  "not-an-arn",
+					UserId:   "AROAAAAAAAAAAAAAAAAAA",
+					Username: "kubernetes-admin",
+					Groups:   []string{"system:masters"},
+				},
+			},
+			expectedIDMapping: nil,
+			expectedError:     errutil.ErrIDAndARNMismatch,
+		},
+		{
+			description: "UserID strict: malformed UserARN is rejected even when UserID matches.",
+			identity: &token.Identity{
+				ARN:          "arn:aws:iam::012345678912:user/real",
+				CanonicalARN: "arn:aws:iam::012345678912:user/real",
+				UserID:       "AIDAAAAAAAAAAAAAAAAAA",
+			},
+			users: map[string]config.UserMapping{
+				"AIDAAAAAAAAAAAAAAAAAA": {
+					UserARN:  "garbage",
+					UserId:   "AIDAAAAAAAAAAAAAAAAAA",
+					Username: "kubernetes-admin",
+					Groups:   []string{"system:masters"},
+				},
+			},
+			roles:             map[string]config.RoleMapping{},
+			expectedIDMapping: nil,
+			expectedError:     errutil.ErrIDAndARNMismatch,
+		},
+		{
+			description: "UserID strict: No ARN provided.",
+			identity: &token.Identity{
+				ARN:          "arn:aws:iam::012345678912:user/matt",
+				CanonicalARN: "arn:aws:iam::012345678912:user/matt",
+				UserID:       "1234",
+			},
+			users: map[string]config.UserMapping{
+				"1234": {
+					UserId:   "1234",
+					Username: "asdf",
+					Groups:   []string{"asdf"},
+				},
+			},
+			roles: map[string]config.RoleMapping{},
+			expectedIDMapping: &config.IdentityMapping{
+				IdentityARN: "arn:aws:iam::012345678912:user/matt",
+				Username:    "asdf",
+				Groups:      []string{"asdf"},
+			},
+			expectedError: nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.description, func(t *testing.T) {
+
+			mapper := makeMapper(tc.users, tc.roles, "test.txt", true)
+			identityMapping, err := mapper.Map(tc.identity)
+
+			if tc.expectedError != nil {
+				if err == nil {
+					t.Errorf("expected error %v but didn't get one", tc.expectedError)
+				} else if err != tc.expectedError {
+					t.Errorf("expected error %v but got %v", tc.expectedError, err)
+				}
+			}
+
+			if tc.expectedError == nil && err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+
+			if diff := cmp.Diff(tc.expectedIDMapping, identityMapping); diff != "" {
+				t.Errorf("Result mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
 }

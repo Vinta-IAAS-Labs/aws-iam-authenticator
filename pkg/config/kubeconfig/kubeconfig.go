@@ -14,19 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Package kubeconfig provides utilities for generating kubeconfig files.
 package kubeconfig
 
 import (
 	"crypto/tls"
+	"fmt"
 	"os"
-	"text/template"
 
 	"github.com/sirupsen/logrus"
 
 	"sigs.k8s.io/aws-iam-authenticator/pkg/config/certs"
 )
 
-type KubeconfigParams struct {
+// KubeconfigParams holds parameters for generating a kubeconfig file.
+type KubeconfigParams struct { //nolint:revive // exported: stutter preserved for backwards compatibility
 	ServerURL                  string
 	CertificateAuthorityBase64 string
 	Token                      string
@@ -39,25 +41,27 @@ func CreateWebhookKubeconfig(cert *tls.Certificate, kubeconfigPath, serverURL st
 	return KubeconfigParams{
 		ServerURL:                  serverURL,
 		CertificateAuthorityBase64: certs.CertToPEMBase64(cert.Certificate[0]),
-	}.WriteKubeconfig(kubeconfigPath, webhookKubeconfigTemplate)
+	}.WriteKubeconfig(kubeconfigPath)
 }
 
-func (p KubeconfigParams) WriteKubeconfig(outputPath string, t *template.Template) error {
-	f, err := os.Create(outputPath)
+// WriteKubeconfig renders and writes a kubeconfig file to the given output path.
+func (p KubeconfigParams) WriteKubeconfig(outputPath string) error {
+	f, err := os.Create(outputPath) //nolint:gosec // G304: outputPath is a config-provided path, not user input
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	return t.Execute(f, p)
-}
+	defer func() {
+		if err := f.Close(); err != nil {
+			logrus.WithError(err).Warn("error closing file")
+		}
+	}()
 
-var webhookKubeconfigTemplate = template.Must(
-	template.New("webhook.kubeconfig").Option("missingkey=error").Parse(`
+	_, err = fmt.Fprintf(f, `
 clusters:
   - name: aws-iam-authenticator
     cluster:
-      certificate-authority-data: {{.CertificateAuthorityBase64}}
-      server: {{.ServerURL}}
+      certificate-authority-data: %s
+      server: %s
 # user refers to the API server client
 users:
   - name: apiserver
@@ -67,4 +71,6 @@ contexts:
   context:
     cluster: aws-iam-authenticator
     user: apiserver
-`))
+`, p.CertificateAuthorityBase64, p.ServerURL)
+	return err
+}

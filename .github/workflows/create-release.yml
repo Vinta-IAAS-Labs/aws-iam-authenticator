@@ -1,0 +1,45 @@
+# Github Action to create a release with goreleaser
+name: Create Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'master'
+    paths:
+      - version.txt
+
+jobs:
+  release:
+    if: ${{ github.repository == 'kubernetes-sigs/aws-iam-authenticator' }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          ssh-key: "${{ secrets.RELEASE_KEY }}"
+
+      - name: Tag release
+        run: |
+          /usr/bin/git config --global user.email actions@github.com
+          /usr/bin/git config --global user.name 'GitHub Actions Release Tagger'
+          hack/tag-release.sh
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version-file: .go-version
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@ec59f474b9834571250b370d4735c50f8e2d1e29
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
